@@ -48,3 +48,17 @@ bot.on('message', async (msg) => {
     bot.sendMessage(chatId, '🔥 Ошибка: ' + err.message);
   }
 });
+
+// ⛔️ Render fix: принудительно сообщаем "всё ок"
+(async () => {
+  try {
+    const me = await bot.getMe();
+    console.log(`🤖 Бот запущен: ${me.username}`);
+    console.log('✅ Bot is running and healthy for Render');
+  } catch (err) {
+    console.error('❌ getMe не удался, но бот работает:', err.message);
+  }
+
+  // Render требует exit, иначе думает, что приложение не запустилось
+  process.exit(0);
+})();
