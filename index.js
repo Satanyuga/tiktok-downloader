@@ -15,8 +15,9 @@ let isProcessing = false;
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
 
+  // 🛡️ Защита от мусора
   if (!msg.text || typeof msg.text !== 'string') {
-    return bot.sendMessage(chatId, '⚠️ Только TikTok ссылки, без стикеров!');
+    return bot.sendMessage(chatId, '⚠️ Пришли TikTok ссылку, а не картинку!');
   }
 
   const url = msg.text.trim();
@@ -29,7 +30,6 @@ bot.on('message', async (msg) => {
     return bot.sendMessage(chatId, '🚫 Эта ссылка уже обрабатывалась.');
   }
 
-  // Добавляем в очередь
   queue.push({ chatId, url });
   processedLinks.add(url);
 
@@ -71,21 +71,19 @@ async function processQueue() {
       await bot.sendMessage(chatId, '🔥 Ошибка: ' + err.message);
     }
 
-    await new Promise((r) => setTimeout(r, 2000)); // задержка между ссылками
+    await new Promise((r) => setTimeout(r, 2000)); // 🔁 задержка между задачами
   }
 
   isProcessing = false;
 }
 
-// 🧢 Render fix
+// 🔧 Просто логируем запуск — НИЧЕГО не вырубаем
 (async () => {
   try {
     const me = await bot.getMe();
     console.log(`🤖 Бот запущен: ${me.username}`);
-    console.log('✅ Bot is running and healthy for Render');
+    console.log('✅ Bot активен, Render пусть не буянит');
   } catch (err) {
     console.error('❌ getMe не удался:', err.message);
   }
-
-  process.exit(0);
 })();
