@@ -3,7 +3,13 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
-const TELEGRAM_TOKEN = '8378347903:AAGH5GCOaKGWFIBIPO3hV5-AntVGGLOsCC8';
+// ✅ токен теперь берётся из переменной среды
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+
+if (!TELEGRAM_TOKEN) {
+  throw new Error('❌ TELEGRAM_TOKEN не установлен в переменных среды.');
+}
+
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 bot.on('message', async (msg) => {
@@ -32,7 +38,7 @@ bot.on('message', async (msg) => {
 
     writer.on('finish', async () => {
       await bot.sendVideo(chatId, videoPath, { caption: '🎬 Вот твоё видео' });
-      fs.unlinkSync(videoPath); // Удаляем файл после отправки
+      fs.unlinkSync(videoPath); // удаляем файл после отправки
     });
 
     writer.on('error', () => {
