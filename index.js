@@ -1,50 +1,49 @@
-var Telegram = require('node-telegram-bot-api');
-var request = require("request");
-var token = '8378347903:AAGH5GCOaKGWFIBIPO3hV5-AntVGGLOsCC8';
-// Configure the bot to use polling
-var opt = {
-  polling: true
-};
+const TelegramBot = require('node-telegram-bot-api');
+const fetch = require('node-fetch');
 
-var bot = new Telegram(token, opt);
+// 🔑 Вставь сюда свой токен
+const token = '8378347903:AAGH5GCOaKGWFIBIPO3hV5-AntVGGLOsCC8';
 
-// Event listener for receiving messages
-bot.on("message", function(msg) {
-  var text = msg.text;
+// 🚀 Запускаем бот с polling
+const bot = new TelegramBot(token, { polling: true });
 
-  if (text == '/start') {
-    // Send a welcome message
-    bot.sendMessage(msg.chat.id, "👋 Hi, I am a bot for downloading TikTok videos without watermark.");
-    
-    // Delay for 500ms and then send another message
-    function delay(time) {
-      return new Promise(resolve => setTimeout(resolve, time));
-    }
+// ⏳ Простая задержка
+function delay(time) {
+  return new Promise(resolve => setTimeout(resolve, time));
+}
 
-    delay(500).then(() => bot.sendMessage(msg.chat.id, "✨ Please send the video link"));
+// ✅ Стартовое сообщение
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text;
+
+  console.log(`Получено сообщение от ${chatId}: ${text}`);
+
+  if (text === '/start') {
+    bot.sendMessage(chatId, '👋 Привет! Я бот для скачивания TikTok-видео без водяного знака.');
+    await delay(500);
+    bot.sendMessage(chatId, '✨ Просто пришли мне ссылку на видео.');
   } else if (text.includes('tiktok.com')) {
-    // Acknowledge receipt of the TikTok link
-    bot.sendMessage(msg.chat.id, "⏳Please wait...");
+    bot.sendMessage(chatId, '⏳ Скачиваю видео, подожди чуть-чуть...');
 
-    // Request the video from the TikTok API
-    var reqvideourl = "https://www.tikwm.com/api/?url=" + text + "&hd=1";
-    request(reqvideourl, function(error, response, body) {
-      var json = JSON.parse(body);
+    const apiUrl = `https://www.tikwm.com/api/?url=${text}&hd=1`;
 
-      // Check if the video data is available
-      if (json.data == undefined) {
-        bot.sendMessage(msg.chat.id, "😔 Sorry, I can't download this video right now. Please try again later.");
-      } else {
-        // Delay for 500ms and then send the video
-        function delay(time) {
-          return new Promise(resolve => setTimeout(resolve, time));
-        }
+    try {
+      const res = await fetch(apiUrl);
+      const json = await res.json();
 
-        delay(500).then(() => bot.sendVideo(msg.chat.id, json.data.hdplay));
+      if (!json.data || !json.data.hdplay) {
+        bot.sendMessage(chatId, '😔 Не удалось получить видео. Возможно, ссылка нерабочая или TikTok временно недоступен.');
+        return;
       }
-    });
+
+      await delay(500);
+      bot.sendVideo(chatId, json.data.hdplay);
+    } catch (err) {
+      console.error('Ошибка при загрузке:', err);
+      bot.sendMessage(chatId, '⚠️ Произошла ошибка при скачивании. Попробуй снова позже.');
+    }
   } else {
-    // Prompt the user to send a valid link
-    bot.sendMessage(msg.chat.id, "🧐 Please send a valid video link");
+    bot.sendMessage(chatId, '🧐 Пришли, пожалуйста, ссылку на TikTok-видео.');
   }
 });
