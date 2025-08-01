@@ -82,9 +82,16 @@ process.once('SIGTERM', () => {
   process.exit(0);
 });
 
-// 🚀 Анти-сон пинг + лог каждые 5 минут
+// 🚀 Анти-сон пинг Express порта каждые 5 минут
 setInterval(() => {
   axios.get(`http://localhost:${PORT}/`)
     .then(() => console.log('📣 Я не сплю. 🐺'))
     .catch((e) => console.error('⚠️ Пинг сбой:', e.message));
+}, 5 * 60 * 1000);
+
+// 🎬 Эмуляция запроса TikTok ролика каждые 5 минут (без отправки в Telegram)
+setInterval(() => {
+  const fakeVideoUrl = 'https://www.tiktok.com/@bellapoarch/video/7338180453062479134?is_from_webapp=1&sender_device=pc';
+  console.log(`🎯 Фейковый TikTok запрос: ${fakeVideoUrl}`);
+  console.log('✅ Я получил ролик. Я всё ещё не сплю.');
 }, 5 * 60 * 1000);
