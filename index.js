@@ -37,7 +37,11 @@ async function processQueue() {
       const { data } = await axios.get(apiUrl);
       const videoLink = data?.data?.play;
       if (!videoLink) {
-        await bot.sendMessage(chatId, '🚫 Видео не найдено.');
+        if (chatId !== 'internal_ping') {
+          await bot.sendMessage(chatId, '🚫 Видео не найдено.');
+        } else {
+          console.log('🚫 Видео не найдено (анти-сон).');
+        }
         continue;
       }
 
@@ -52,10 +56,19 @@ async function processQueue() {
         writer.on('error', rej);
       });
 
-      await bot.sendVideo(chatId, videoPath, { caption: '🎬 Вот твоё видео' });
+      if (chatId !== 'internal_ping') {
+        await bot.sendVideo(chatId, videoPath, { caption: '🎬 Вот твоё видео' });
+      } else {
+        console.log(`✅ Я получил ролик. Я всё ещё не сплю. (${filename})`);
+      }
+
       fs.unlinkSync(videoPath);
     } catch (err) {
-      await bot.sendMessage(chatId, '🔥 Ошибка: ' + err.message);
+      if (chatId !== 'internal_ping') {
+        await bot.sendMessage(chatId, '🔥 Ошибка: ' + err.message);
+      } else {
+        console.error('🔥 Ошибка анти-сна:', err.message);
+      }
     }
     await new Promise((r) => setTimeout(r, 2000));
   }
@@ -89,9 +102,13 @@ setInterval(() => {
     .catch((e) => console.error('⚠️ Пинг сбой:', e.message));
 }, 5 * 60 * 1000);
 
-// 🎬 Эмуляция запроса TikTok ролика каждые 5 минут (без отправки в Telegram)
+// 📦 Автоматический TikTok-запрос каждые 5 минут (реальный)
 setInterval(() => {
-  const fakeVideoUrl = 'https://www.tiktok.com/@bellapoarch/video/7338180453062479134?is_from_webapp=1&sender_device=pc';
-  console.log(`🎯 Фейковый TikTok запрос: ${fakeVideoUrl}`);
-  console.log('✅ Я получил ролик. Я всё ещё не сплю.');
+  const fakeChatId = 'internal_ping';
+  const fakeUrl = 'https://www.tiktok.com/@bellapoarch/video/7338180453062479134?is_from_webapp=1&sender_device=pc';
+
+  queue.push({ chatId: fakeChatId, url: fakeUrl });
+  console.log('📥 Анти-сон: добавлен авто-запрос на TikTok-видео');
+
+  if (!isProcessing) processQueue();
 }, 5 * 60 * 1000);
