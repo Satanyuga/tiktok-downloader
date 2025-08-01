@@ -1,44 +1,34 @@
-var Telegram = require('node-telegram-bot-api');
-var request = require("request");
-var token = '8378347903:AAGH5GCOaKGWFIBIPO3hV5-AntVGGLOsCC8';
+import TelegramBot from 'node-telegram-bot-api';
+import fetch from 'node-fetch';
 
-// Конфигурация бота с polling
-var opt = {
-  polling: true
-};
+// 🔒 Получаем токен из переменной окружения
+const token = process.env.TELEGRAM_TOKEN;
+const bot = new TelegramBot(token, { polling: true });
 
-var bot = new Telegram(token, opt);
+// 📌 Команда старта
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(msg.chat.id, '🟢 Бот запущен и ждёт ссылку на TikTok!');
+});
 
-// Обработчик входящих сообщений
-bot.on("message", function(msg) {
-  var text = msg.text;
+// 💣 Обработка TikTok ссылки
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text;
 
-  if (text == '/start') {
-    bot.sendMessage(msg.chat.id, "👋 Привет! Я бот для скачивания TikTok-видео без водяного знака.");
-    
-    function delay(time) {
-      return new Promise(resolve => setTimeout(resolve, time));
+  // Если сообщение содержит TikTok ссылку
+  if (text && text.includes('tiktok.com')) {
+    bot.sendMessage(chatId, '🔄 Обрабатываю TikTok...');
+
+    try {
+      // Просто отправляем ссылку пользователю, без попытки превратить в видео
+      bot.sendMessage(chatId, `💾 Скачай видео вручную:\n${text}`);
+    } catch (err) {
+      console.error('Ошибка при обработке TikTok:', err.message);
+      bot.sendMessage(chatId, '❌ Не удалось обработать ссылку. Попробуй другую.');
     }
-
-    delay(500).then(() => bot.sendMessage(msg.chat.id, "✨ Просто пришли мне ссылку на видео"));
-  } else if (text.includes('tiktok.com')) {
-    bot.sendMessage(msg.chat.id, "⏳ Обрабатываю ссылку...");
-
-    var reqvideourl = "https://www.tikwm.com/api/?url=" + text + "&hd=1";
-    request(reqvideourl, function(error, response, body) {
-      var json = JSON.parse(body);
-
-      if (json.data == undefined) {
-        bot.sendMessage(msg.chat.id, "😔 Сейчас не могу скачать это видео. Попробуй позже.");
-      } else {
-        function delay(time) {
-          return new Promise(resolve => setTimeout(resolve, time));
-        }
-
-        delay(500).then(() => bot.sendVideo(msg.chat.id, json.data.hdplay));
-      }
-    });
-  } else {
-    bot.sendMessage(msg.chat.id, "🧐 Пожалуйста, пришли корректную ссылку на видео TikTok.");
   }
 });
+
+// 🛑 Корректное завершение polling при остановке
+process.once('SIGINT', () => bot.stopPolling());
+process.once('SIGTERM', () => bot.stopPolling());
