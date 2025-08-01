@@ -1,34 +1,28 @@
-import TelegramBot from 'node-telegram-bot-api';
-import fetch from 'node-fetch';
+const TelegramBot = require('node-telegram-bot-api');
 
-// 🔒 Получаем токен из переменной окружения
-const token = process.env.TELEGRAM_TOKEN;
+// 🚨 ВПИСАННЫЙ ТОКЕН БЕЗ заморочек
+const token = '8378347903:AAGH5GCOaKGWFIBIPO3hV5-AntVGGLOsCC8';
+
 const bot = new TelegramBot(token, { polling: true });
 
-// 📌 Команда старта
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, '🟢 Бот запущен и ждёт ссылку на TikTok!');
+  bot.sendMessage(msg.chat.id, '🟢 Бот работает. Сюда кидай TikTok-ссылку.');
 });
 
-// 💣 Обработка TikTok ссылки
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
-  // Если сообщение содержит TikTok ссылку
   if (text && text.includes('tiktok.com')) {
-    bot.sendMessage(chatId, '🔄 Обрабатываю TikTok...');
-
     try {
-      // Просто отправляем ссылку пользователю, без попытки превратить в видео
-      bot.sendMessage(chatId, `💾 Скачай видео вручную:\n${text}`);
+      bot.sendMessage(chatId, `🔗 Видео:\n${text}\n⚠️ Отправка как видео не поддерживается, скачай вручную.`);
     } catch (err) {
-      console.error('Ошибка при обработке TikTok:', err.message);
-      bot.sendMessage(chatId, '❌ Не удалось обработать ссылку. Попробуй другую.');
+      console.error('Ошибка при обработке:', err.message);
+      bot.sendMessage(chatId, '❌ Что-то пошло не так, попробуй другую ссылку.');
     }
   }
 });
 
-// 🛑 Корректное завершение polling при остановке
+// Корректная остановка polling
 process.once('SIGINT', () => bot.stopPolling());
 process.once('SIGTERM', () => bot.stopPolling());
