@@ -1,9 +1,14 @@
 {
-  "name": "tiktok-save-bot",
+  "name": "tg-bot-worker",
   "version": "1.0.0",
   "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
-    "node-telegram-bot-api": "^0.61.0",
-    "request": "^2.88.2"
+    "node-telegram-bot-api": "^0.61.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
