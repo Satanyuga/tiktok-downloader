@@ -4,13 +4,11 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
-// 🧠 Express-заглушка для Render
 const app = express();
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('🤖 Bot is alive'));
 app.listen(PORT, () => console.log(`🧠 Express работает на порту ${PORT}`));
 
-// 🛡️ Токен из переменной окружения
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не установлен.');
 
@@ -73,13 +71,20 @@ async function processQueue() {
   }
 })();
 
-// 🚨 Фикс для Render: авто-выключение при завершении билда
+// 🚨 Авто-завершение при отключении Render
 process.once('SIGINT', () => {
-  console.log('🧨 SIGINT пойман. Бот завершает работу...');
+  console.log('🧨 SIGINT пойман. Завершаем...');
   process.exit(0);
 });
 
 process.once('SIGTERM', () => {
-  console.log('🔪 SIGTERM получен. Уничтожаем процесс...');
+  console.log('🔪 SIGTERM пойман. Уничтожаем...');
   process.exit(0);
 });
+
+// 🚀 Анти-сон пинг + лог каждые 5 минут
+setInterval(() => {
+  axios.get(`http://localhost:${PORT}/`)
+    .then(() => console.log('📣 Я не сплю. 🐺'))
+    .catch((e) => console.error('⚠️ Пинг сбой:', e.message));
+}, 5 * 60 * 1000);
