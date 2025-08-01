@@ -1,3 +1,12 @@
+// 🧠 Express-заглушка для Render
+const express = require('express');
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => res.send('🤖 Bot is alive'));
+app.listen(PORT, () => console.log(`🧠 Express-заглушка работает на порту ${PORT}`));
+
+// 📦 Telegram-бот
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const fs = require('fs');
@@ -71,13 +80,12 @@ async function processQueue() {
       await bot.sendMessage(chatId, '🔥 Ошибка: ' + err.message);
     }
 
-    await new Promise((r) => setTimeout(r, 2000)); // 🔁 задержка между задачами
+    await new Promise((r) => setTimeout(r, 2000));
   }
 
   isProcessing = false;
 }
 
-// 🔧 Просто логируем запуск — НИЧЕГО не вырубаем
 (async () => {
   try {
     const me = await bot.getMe();
