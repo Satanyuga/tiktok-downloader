@@ -1,18 +1,14 @@
 const TelegramBot = require('node-telegram-bot-api');
-const fetch = require('node-fetch');
+const { fetch } = require('undici'); // ✅ Новый способ
 
-// 🔑 Вставь сюда свой токен
 const token = '8378347903:AAGH5GCOaKGWFIBIPO3hV5-AntVGGLOsCC8';
 
-// 🚀 Запускаем бот с polling
 const bot = new TelegramBot(token, { polling: true });
 
-// ⏳ Простая задержка
 function delay(time) {
   return new Promise(resolve => setTimeout(resolve, time));
 }
 
-// ✅ Стартовое сообщение
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
