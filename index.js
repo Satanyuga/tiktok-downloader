@@ -17,7 +17,6 @@ if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не установле
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 const queue = [];
-const processedLinks = new Set();
 let isProcessing = false;
 
 bot.on('message', async (msg) => {
@@ -25,10 +24,9 @@ bot.on('message', async (msg) => {
   if (!msg.text || typeof msg.text !== 'string') return bot.sendMessage(chatId, '⚠️ Пришли TikTok ссылку, а не картинку!');
   const url = msg.text.trim();
   if (!url.startsWith('http') || !url.includes('tiktok')) return bot.sendMessage(chatId, '⚠️ Это не похоже на TikTok ссылку.');
-  if (processedLinks.has(url)) return bot.sendMessage(chatId, '🚫 Эта ссылка уже обрабатывалась.');
 
   queue.push({ chatId, url });
-  processedLinks.add(url);
+
   if (!isProcessing) processQueue();
 });
 
