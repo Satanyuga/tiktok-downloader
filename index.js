@@ -72,3 +72,14 @@ async function processQueue() {
     console.error('❌ Ошибка getMe:', err.message);
   }
 })();
+
+// 🚨 Фикс для Render: авто-выключение при завершении билда
+process.once('SIGINT', () => {
+  console.log('🧨 SIGINT пойман. Бот завершает работу...');
+  process.exit(0);
+});
+
+process.once('SIGTERM', () => {
+  console.log('🔪 SIGTERM получен. Уничтожаем процесс...');
+  process.exit(0);
+});
