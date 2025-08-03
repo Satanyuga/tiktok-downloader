@@ -1,26 +1,30 @@
+// 📦 Основные модули
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
-const chromium = require('chrome-aws-lambda');
-const puppeteer = require('puppeteer-core');
+const cheerio = require('cheerio');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// 🌐 Публичный адрес на Render для анти-сна
 const RENDER_URL = 'https://tiktokbot-1100.onrender.com';
 
+// ✅ Убедимся, что бот онлайн
 app.get('/', (req, res) => res.send('🤖 Bot is alive'));
 app.listen(PORT, () => console.log(`🧠 Express слушает порт ${PORT}`));
 
+// 🔐 Получаем токен из переменных окружения
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не установлен.');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
+// 📦 Очередь ссылок для обработки
 const queue = [];
 let isProcessing = false;
 
+// 📥 Telegram-сообщение — проверка ссылки и добавление в очередь
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const url = msg.text?.trim();
@@ -32,77 +36,74 @@ bot.on('message', async (msg) => {
   if (!isProcessing) processQueue();
 });
 
-async function extractImages(url) {
-  const browser = await puppeteer.launch({
-    args: chromium.args,
-    executablePath: await chromium.executablePath,
-    headless: chromium.headless,
-  });
+// 🧠 Парсинг картинок из TikTok страницы
+async function extractImagesFromPage(pageUrl) {
+  try {
+    const { data } = await axios.get(pageUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        'Referer': 'https://www.tiktok.com/',
+      }
+    });
 
-  const page = await browser.newPage();
-  await page.goto(url, { waitUntil: 'networkidle2' });
+    const $ = cheerio.load(data);
+    const imageLinks = [];
 
-  const imgs = await page.$$eval('img', list =>
-    list.map(img => img.src).filter(src =>
-      src.includes('object') && src.endsWith('.jpg')
-    )
-  );
+    $('img').each((_, el) => {
+      const src = $(el).attr('src');
+      if (src && src.includes('object') && src.endsWith('.jpg')) {
+        imageLinks.push(src);
+      }
+    });
 
-  await browser.close();
-  return [...new Set(imgs)];
+    return [...new Set(imageLinks)];
+  } catch (err) {
+    console.error('🧨 Ошибка парсинга TikTok страницы:', err.message);
+    return [];
+  }
 }
 
+// 🚀 Обработка очереди: либо видео (через TikWM), либо картинки (через Cheerio)
 async function processQueue() {
   isProcessing = true;
+
   while (queue.length > 0) {
     const { chatId, url } = queue.shift();
     try {
+      // 🧪 Пробуем получить видео через TikWM
       const { data } = await axios.get(`https://tikwm.com/api/?url=${encodeURIComponent(url)}`);
       const videoLink = data?.data?.play;
 
       if (videoLink) {
-        const filename = `video_${Date.now()}.mp4`;
-        const videoPath = path.resolve(__dirname, filename);
-        const stream = await axios.get(videoLink, { responseType: 'stream' });
-        const writer = fs.createWriteStream(videoPath);
-        stream.data.pipe(writer);
-        await new Promise((res, rej) => {
-          writer.on('finish', res);
-          writer.on('error', rej);
-        });
+        return bot.sendMessage(chatId, '🎬 Видео найдено, но эта версия бота поддерживает ТОЛЬКО картинки. Картинки ищем…');
+      }
 
-        chatId !== 'internal_ping'
-          ? await bot.sendVideo(chatId, videoPath, { caption: '🎬 Вот твоё видео' })
-          : console.log(`✅ Видео скачано: ${filename}`);
+      // 🖼️ Парсим картинки, если видео не найдено
+      const images = await extractImagesFromPage(url);
 
-        fs.unlinkSync(videoPath);
+      if (images.length > 0) {
+        const mediaGroup = images.slice(0, 10).map((src, index) => ({
+          type: 'photo',
+          media: src,
+          caption: index === 0 ? '🖼️ Галерея из TikTok' : undefined,
+        }));
+
+        await bot.sendMediaGroup(chatId, mediaGroup);
       } else {
-        const images = await extractImages(url);
-        if (images.length > 0) {
-          const mediaGroup = images.map((img, i) => ({
-            type: 'photo',
-            media: img,
-            caption: i === 0 ? '🖼️ Галерея TikTok' : undefined
-          }));
-          chatId !== 'internal_ping'
-            ? await bot.sendMediaGroup(chatId, mediaGroup)
-            : console.log(`✅ Картинок: ${images.length}`);
-        } else {
-          chatId !== 'internal_ping'
-            ? await bot.sendMessage(chatId, '📭 Ничего не найдено.')
-            : console.log('📭 Пусто');
-        }
+        await bot.sendMessage(chatId, '📭 Картинки не найдены.');
       }
     } catch (err) {
-      chatId !== 'internal_ping'
-        ? await bot.sendMessage(chatId, `🔥 Ошибка: ${err.message}`)
-        : console.error('🔥 Ошибка:', err.message);
+      console.error('🔥 Ошибка обработки:', err.message);
+      await bot.sendMessage(chatId, `🔥 Ошибка: ${err.message}`);
     }
-    await new Promise(r => setTimeout(r, 2000));
+
+    await new Promise((r) => setTimeout(r, 2000));
   }
+
   isProcessing = false;
 }
 
+// 🔍 Проверка Telegram-подключения
 (async () => {
   try {
     const me = await bot.getMe();
@@ -112,6 +113,7 @@ async function processQueue() {
   }
 })();
 
+// 💤 Обработка сигналов завершения
 process.once('SIGINT', () => {
   console.log('🧨 SIGINT. Завершаем...');
   process.exit(0);
@@ -121,17 +123,19 @@ process.once('SIGTERM', () => {
   process.exit(0);
 });
 
+// 📡 Пинг внешнего Render-адреса каждые 5 минут (анти-сон)
 setInterval(() => {
   axios.get(RENDER_URL + '/')
-    .then(() => console.log('📡 Render пинг прошёл'))
-    .catch((e) => console.error('⚠️ Пинг ошибка:', e.message));
+    .then(() => console.log('📡 Внешний пинг прошёл. Render проснулся.'))
+    .catch((e) => console.error('⚠️ Сбой внешнего пинга:', e.message));
 }, 5 * 60 * 1000);
 
+// ⏰ TikTok-запрос для анти-сна каждые 5 минут
 setInterval(() => {
   queue.push({
     chatId: 'internal_ping',
-    url: 'https://www.tiktok.com/@bellapoarch/video/7338180453062479134?is_from_webapp=1&sender_device=pc'
+    url: 'https://www.tiktok.com/@bellapoarch/video/7338180453062479134'
   });
-  console.log('📥 Автозапрос добавлен');
+  console.log('📥 Автоматический запрос на TikTok добавлен');
   if (!isProcessing) processQueue();
 }, 5 * 60 * 1000);
