@@ -86,11 +86,11 @@ async function processQueue() {
           }));
           chatId !== 'internal_ping'
             ? await bot.sendMediaGroup(chatId, mediaGroup)
-            : console.log(`✅ Изображений: ${images.length}`);
+            : console.log(`✅ Картинок: ${images.length}`);
         } else {
           chatId !== 'internal_ping'
             ? await bot.sendMessage(chatId, '📭 Ничего не найдено.')
-            : console.log('📭 Нет галереи');
+            : console.log('📭 Пусто');
         }
       }
     } catch (err) {
