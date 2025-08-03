@@ -24,7 +24,7 @@ let isProcessing = false;
 
 // ⏰ Пинг самого себя каждые 5 минут + лог
 setInterval(() => {
-  axios.get("https://tiktok-downloader-xxxx.onrender.com/ping")
+  axios.get("https://tiktokbot-1100.onrender.com/ping")
     .then(() => console.log(`[${new Date().toLocaleTimeString()}] 🔄 Я не сплю. Пинганул Render.`))
     .catch(() => console.log(`[${new Date().toLocaleTimeString()}] ⚠️ Пинг не прошёл.`));
 }, 300000);
