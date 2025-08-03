@@ -3,11 +3,10 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const puppeteer = require('puppeteer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// ✅ Правильный публичный Render-адрес:
 const RENDER_URL = 'https://tiktokbot-1100.onrender.com';
 
 app.get('/', (req, res) => res.send('🤖 Bot is alive'));
@@ -21,7 +20,6 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const queue = [];
 let isProcessing = false;
 
-// 📥 Получение сообщений от Telegram
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const url = msg.text?.trim();
@@ -33,6 +31,19 @@ bot.on('message', async (msg) => {
   if (!isProcessing) processQueue();
 });
 
+async function parseGalleryImages(url) {
+  const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox'] });
+  const page = await browser.newPage();
+  await page.goto(url, { waitUntil: 'networkidle2' });
+
+  const images = await page.$$eval('img', imgs =>
+    imgs.map(img => img.src).filter(src => src.includes('object') && src.endsWith('.jpg'))
+  );
+
+  await browser.close();
+  return [...new Set(images)];
+}
+
 async function processQueue() {
   isProcessing = true;
   while (queue.length > 0) {
@@ -40,16 +51,7 @@ async function processQueue() {
     try {
       const { data } = await axios.get(`https://tikwm.com/api/?url=${encodeURIComponent(url)}`);
       const content = data?.data;
-
-      if (!content) {
-        chatId !== 'internal_ping'
-          ? await bot.sendMessage(chatId, '🚫 Ничего не найдено по ссылке.')
-          : console.log('🚫 Пустой ответ (анти-сон)');
-        continue;
-      }
-
-      const videoLink = content.play;
-      const imageList = content.images;
+      const videoLink = content?.play;
 
       if (videoLink) {
         const filename = `video_${Date.now()}.mp4`;
@@ -57,7 +59,6 @@ async function processQueue() {
         const stream = await axios.get(videoLink, { responseType: 'stream' });
         const writer = fs.createWriteStream(videoPath);
         stream.data.pipe(writer);
-
         await new Promise((res, rej) => {
           writer.on('finish', res);
           writer.on('error', rej);
@@ -68,27 +69,24 @@ async function processQueue() {
           : console.log(`✅ Видео скачано: ${filename}`);
 
         fs.unlinkSync(videoPath);
-      } else if (Array.isArray(imageList) && imageList.length > 0) {
-        const mediaGroup = [];
-
-        for (let i = 0; i < imageList.length; i++) {
-          mediaGroup.push({
-            type: 'photo',
-            media: imageList[i],
-            caption: i === 0 ? '🖼️ Галерея изображений TikTok' : undefined
-          });
-        }
-
-        chatId !== 'internal_ping'
-          ? await bot.sendMediaGroup(chatId, mediaGroup)
-          : console.log(`✅ Изображений: ${imageList.length} (анти-сон)`);
-
       } else {
-        chatId !== 'internal_ping'
-          ? await bot.sendMessage(chatId, '📭 Контент не содержит ни видео, ни изображений.')
-          : console.log('📭 Нет видео/изображений (анти-сон)');
-      }
+        const gallery = await parseGalleryImages(url);
+        if (gallery.length > 0) {
+          const mediaGroup = gallery.map((img, i) => ({
+            type: 'photo',
+            media: img,
+            caption: i === 0 ? '🖼️ Галерея из TikTok' : undefined
+          }));
 
+          chatId !== 'internal_ping'
+            ? await bot.sendMediaGroup(chatId, mediaGroup)
+            : console.log(`✅ Картинок в галерее: ${gallery.length}`);
+        } else {
+          chatId !== 'internal_ping'
+            ? await bot.sendMessage(chatId, '📭 Контент не содержит ни видео, ни изображений.')
+            : console.log('📭 Нет контента');
+        }
+      }
     } catch (err) {
       chatId !== 'internal_ping'
         ? await bot.sendMessage(chatId, `🔥 Ошибка: ${err.message}`)
@@ -99,7 +97,6 @@ async function processQueue() {
   isProcessing = false;
 }
 
-// 🔍 Проверка Telegram-подключения
 (async () => {
   try {
     const me = await bot.getMe();
@@ -109,7 +106,6 @@ async function processQueue() {
   }
 })();
 
-// 💤 Обработка сигналов завершения
 process.once('SIGINT', () => {
   console.log('🧨 SIGINT. Завершаем...');
   process.exit(0);
@@ -119,14 +115,12 @@ process.once('SIGTERM', () => {
   process.exit(0);
 });
 
-// 🌐 Пинг внешнего Render-адреса каждые 5 минут
 setInterval(() => {
   axios.get(RENDER_URL + '/')
     .then(() => console.log('📡 Внешний пинг прошёл. Render проснулся.'))
     .catch((e) => console.error('⚠️ Сбой внешнего пинга:', e.message));
 }, 5 * 60 * 1000);
 
-// ⏰ TikTok-запрос для анти-сна каждые 5 минут
 setInterval(() => {
   queue.push({
     chatId: 'internal_ping',
