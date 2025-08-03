@@ -3,12 +3,11 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const puppeteer = require('puppeteer');
+const chromium = require('chrome-aws-lambda');
+const puppeteer = require('puppeteer-core');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// ✅ Правильный публичный Render-адрес:
 const RENDER_URL = 'https://tiktokbot-1100.onrender.com';
 
 app.get('/', (req, res) => res.send('🤖 Bot is alive'));
@@ -34,18 +33,23 @@ bot.on('message', async (msg) => {
 });
 
 async function extractImages(url) {
-  const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox'] });
+  const browser = await puppeteer.launch({
+    args: chromium.args,
+    executablePath: await chromium.executablePath,
+    headless: chromium.headless,
+  });
+
   const page = await browser.newPage();
   await page.goto(url, { waitUntil: 'networkidle2' });
 
-  const images = await page.$$eval('img', imgs =>
-    imgs.map(img => img.src).filter(src =>
+  const imgs = await page.$$eval('img', list =>
+    list.map(img => img.src).filter(src =>
       src.includes('object') && src.endsWith('.jpg')
     )
   );
 
   await browser.close();
-  return [...new Set(images)];
+  return [...new Set(imgs)];
 }
 
 async function processQueue() {
@@ -62,7 +66,6 @@ async function processQueue() {
         const stream = await axios.get(videoLink, { responseType: 'stream' });
         const writer = fs.createWriteStream(videoPath);
         stream.data.pipe(writer);
-
         await new Promise((res, rej) => {
           writer.on('finish', res);
           writer.on('error', rej);
@@ -74,34 +77,32 @@ async function processQueue() {
 
         fs.unlinkSync(videoPath);
       } else {
-        const imgs = await extractImages(url);
-        if (imgs.length > 0) {
-          const mediaGroup = imgs.map((src, i) => ({
+        const images = await extractImages(url);
+        if (images.length > 0) {
+          const mediaGroup = images.map((img, i) => ({
             type: 'photo',
-            media: src,
-            caption: i === 0 ? '🖼️ Галерея из TikTok' : undefined
+            media: img,
+            caption: i === 0 ? '🖼️ Галерея TikTok' : undefined
           }));
-
           chatId !== 'internal_ping'
             ? await bot.sendMediaGroup(chatId, mediaGroup)
-            : console.log(`✅ Картинок в галерее: ${imgs.length}`);
+            : console.log(`✅ Изображений: ${images.length}`);
         } else {
           chatId !== 'internal_ping'
-            ? await bot.sendMessage(chatId, '📭 Контент не содержит ни видео, ни изображений.')
-            : console.log('📭 Нет контента');
+            ? await bot.sendMessage(chatId, '📭 Ничего не найдено.')
+            : console.log('📭 Нет галереи');
         }
       }
     } catch (err) {
       chatId !== 'internal_ping'
         ? await bot.sendMessage(chatId, `🔥 Ошибка: ${err.message}`)
-        : console.error('🔥 Ошибка анти-сна:', err.message);
+        : console.error('🔥 Ошибка:', err.message);
     }
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 2000));
   }
   isProcessing = false;
 }
 
-// 🔍 Проверка Telegram-подключения
 (async () => {
   try {
     const me = await bot.getMe();
@@ -111,7 +112,6 @@ async function processQueue() {
   }
 })();
 
-// 💤 Обработка сигналов завершения
 process.once('SIGINT', () => {
   console.log('🧨 SIGINT. Завершаем...');
   process.exit(0);
@@ -121,20 +121,17 @@ process.once('SIGTERM', () => {
   process.exit(0);
 });
 
-// 🌐 Пинг внешнего Render-адреса каждые 5 минут
 setInterval(() => {
   axios.get(RENDER_URL + '/')
-    .then(() => console.log('📡 Внешний пинг прошёл. Render проснулся.'))
-    .catch((e) => console.error('⚠️ Сбой внешнего пинга:', e.message));
+    .then(() => console.log('📡 Render пинг прошёл'))
+    .catch((e) => console.error('⚠️ Пинг ошибка:', e.message));
 }, 5 * 60 * 1000);
 
-// ⏰ TikTok-запрос для анти-сна каждые 5 минут
 setInterval(() => {
   queue.push({
     chatId: 'internal_ping',
     url: 'https://www.tiktok.com/@bellapoarch/video/7338180453062479134?is_from_webapp=1&sender_device=pc'
   });
-  console.log('📥 Автоматический запрос на TikTok добавлен');
-
+  console.log('📥 Автозапрос добавлен');
   if (!isProcessing) processQueue();
 }, 5 * 60 * 1000);
