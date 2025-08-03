@@ -39,30 +39,56 @@ async function processQueue() {
     const { chatId, url } = queue.shift();
     try {
       const { data } = await axios.get(`https://tikwm.com/api/?url=${encodeURIComponent(url)}`);
-      const videoLink = data?.data?.play;
-      if (!videoLink) {
+      const content = data?.data;
+
+      if (!content) {
         chatId !== 'internal_ping'
-          ? await bot.sendMessage(chatId, '🚫 Видео не найдено.')
-          : console.log('🚫 Видео не найдено (анти-сон)');
+          ? await bot.sendMessage(chatId, '🚫 Ничего не найдено по ссылке.')
+          : console.log('🚫 Пустой ответ (анти-сон)');
         continue;
       }
 
-      const filename = `video_${Date.now()}.mp4`;
-      const videoPath = path.resolve(__dirname, filename);
-      const stream = await axios.get(videoLink, { responseType: 'stream' });
-      const writer = fs.createWriteStream(videoPath);
-      stream.data.pipe(writer);
+      const videoLink = content.play;
+      const imageList = content.images;
 
-      await new Promise((res, rej) => {
-        writer.on('finish', res);
-        writer.on('error', rej);
-      });
+      if (videoLink) {
+        const filename = `video_${Date.now()}.mp4`;
+        const videoPath = path.resolve(__dirname, filename);
+        const stream = await axios.get(videoLink, { responseType: 'stream' });
+        const writer = fs.createWriteStream(videoPath);
+        stream.data.pipe(writer);
 
-      chatId !== 'internal_ping'
-        ? await bot.sendVideo(chatId, videoPath, { caption: '🎬 Вот твоё видео' })
-        : console.log(`✅ Видео скачано: ${filename}`);
+        await new Promise((res, rej) => {
+          writer.on('finish', res);
+          writer.on('error', rej);
+        });
 
-      fs.unlinkSync(videoPath);
+        chatId !== 'internal_ping'
+          ? await bot.sendVideo(chatId, videoPath, { caption: '🎬 Вот твоё видео' })
+          : console.log(`✅ Видео скачано: ${filename}`);
+
+        fs.unlinkSync(videoPath);
+      } else if (Array.isArray(imageList) && imageList.length > 0) {
+        const mediaGroup = [];
+
+        for (let i = 0; i < imageList.length; i++) {
+          mediaGroup.push({
+            type: 'photo',
+            media: imageList[i],
+            caption: i === 0 ? '🖼️ Галерея изображений TikTok' : undefined
+          });
+        }
+
+        chatId !== 'internal_ping'
+          ? await bot.sendMediaGroup(chatId, mediaGroup)
+          : console.log(`✅ Изображений: ${imageList.length} (анти-сон)`);
+
+      } else {
+        chatId !== 'internal_ping'
+          ? await bot.sendMessage(chatId, '📭 Контент не содержит ни видео, ни изображений.')
+          : console.log('📭 Нет видео/изображений (анти-сон)');
+      }
+
     } catch (err) {
       chatId !== 'internal_ping'
         ? await bot.sendMessage(chatId, `🔥 Ошибка: ${err.message}`)
