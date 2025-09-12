@@ -2,7 +2,7 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const fs = require('fs'); // Оставляем на случай, если что-то пойдёт не так, но в основном не используем
+const fs = require('fs');
 const path = require('path');
 
 // 🔧 Express сервер для Render
