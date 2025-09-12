@@ -16,7 +16,18 @@ app.listen(PORT, () => console.log(`🧠 Express слушает порт ${PORT}
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не указан.');
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot = new TelegramBot(TELEGRAM_TOKEN, { 
+  polling: { 
+    interval: 2000, // Увеличен интервал для избежания 429 Too Many Requests
+    autoStart: true,
+    params: { timeout: 10 } 
+  } 
+});
+
+// Обработка polling ошибок для логов
+bot.on('polling_error', (error) => {
+  console.log(`[polling_error] ${error.code}: ${error.message}`);
+});
 
 // 📦 Очередь сообщений
 const queue = [];
@@ -132,9 +143,4 @@ process.once('SIGINT', () => {
 process.once('SIGTERM', () => {
   console.log('🔪 SIGTERM. Уничтожение...');
   process.exit(0);
-});
-
-// Добавлено: обработка ошибок polling, чтобы бот не падал
-bot.on('polling_error', (error) => {
-  console.error(`[polling_error] ${JSON.stringify(error)}`);
 });
