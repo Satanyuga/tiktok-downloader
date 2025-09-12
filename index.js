@@ -7,7 +7,6 @@ const path = require('path');
 
 // 🔧 Express сервер для Render
 const app = express();
-app.use(express.json()); // Для парсинга JSON в webhook
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('🤖 Bot is alive'));
 app.get('/ping', (req, res) => res.send('✅ Ping OK'));
@@ -17,31 +16,7 @@ app.listen(PORT, () => console.log(`🧠 Express слушает порт ${PORT}
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не указан.');
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { 
-  polling: false,
-  request: {
-    agentOptions: {
-      keepAlive: true,
-      family: 4
-    },
-    url: "https://api.telegram.org"
-  }
-}); // Отключаем polling, используем webhook
-
-// Настраиваем webhook
-const webhookPath = `/bot${TELEGRAM_TOKEN}`;
-const webhookUrl = `https://tiktokbot-1100.onrender.com${webhookPath}`;
-bot.setWebHook(webhookUrl).then(() => {
-  console.log(`✅ Webhook установлен на ${webhookUrl}`);
-}).catch(err => {
-  console.error(`❌ Ошибка установки webhook: ${err.message}`);
-});
-
-// Обработка обновлений от Telegram через webhook
-app.post(webhookPath, (req, res) => {
-  bot.processUpdate(req.body);
-  res.sendStatus(200);
-});
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 // 📦 Очередь сообщений
 const queue = [];
@@ -145,7 +120,7 @@ async function processQueue() {
     const me = await bot.getMe();
     console.log(`🤖 Бот активен: @${me.username}`);
   } catch (err) {
-    console.error('❌ Ошибка getMe: ', err.message);
+    console.error('❌ Ошибка getMe:', err.message);
   }
 })();
 
