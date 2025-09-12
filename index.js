@@ -21,7 +21,14 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, {
     interval: 2000, // Увеличен интервал для избежания 429 Too Many Requests
     autoStart: true,
     params: { timeout: 10 } 
-  } 
+  },
+  request: {
+    agentOptions: {
+      keepAlive: true,
+      family: 4
+    },
+    url: "https://api.telegram.org"
+  }
 });
 
 // Обработка polling ошибок для логов
