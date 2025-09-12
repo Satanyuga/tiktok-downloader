@@ -7,6 +7,7 @@ const path = require('path');
 
 // 🔧 Express сервер для Render
 const app = express();
+app.use(express.json()); // Для парсинга JSON в webhook
 const PORT = process.env.PORT || 3000;
 app.get('/', (req, res) => res.send('🤖 Bot is alive'));
 app.get('/ping', (req, res) => res.send('✅ Ping OK'));
@@ -16,23 +17,21 @@ app.listen(PORT, () => console.log(`🧠 Express слушает порт ${PORT}
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не указан.');
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { 
-  polling: { 
-    interval: 1000, // Уменьшен до 1 секунды, но не чаще, чтобы избежать 429
-    autoStart: true,
-    params: { timeout: 30 } // Увеличен timeout для long polling
-  } 
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false }); // Отключаем polling, используем webhook
+
+// Настраиваем webhook
+const webhookPath = `/bot${TELEGRAM_TOKEN}`;
+const webhookUrl = `https://tiktokbot-1100.onrender.com${webhookPath}`;
+bot.setWebHook(webhookUrl).then(() => {
+  console.log(`✅ Webhook установлен на ${webhookUrl}`);
+}).catch(err => {
+  console.error(`❌ Ошибка установки webhook: ${err.message}`);
 });
 
-// Обработка polling ошибок и рестарт polling если фатал
-bot.on('polling_error', (error) => {
-  console.log(`[polling_error] ${error.code}: ${error.message}`);
-  if (error.code === 'EFATAL' || error.message.includes('AggregateError') || error.message.includes('socket hang up')) {
-    console.log('🔄 Рестартую polling из-за фатальной ошибки...');
-    bot.stopPolling().then(() => {
-      setTimeout(() => bot.startPolling(), 5000); // Рестарт через 5 сек
-    });
-  }
+// Обработка обновлений от Telegram через webhook
+app.post(webhookPath, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
 });
 
 // 📦 Очередь сообщений
