@@ -17,7 +17,16 @@ app.listen(PORT, () => console.log(`🧠 Express слушает порт ${PORT}
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не указан.');
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false }); // Отключаем polling, используем webhook
+const bot = new TelegramBot(TELEGRAM_TOKEN, { 
+  polling: false,
+  request: {
+    agentOptions: {
+      keepAlive: true,
+      family: 4
+    },
+    url: "https://api.telegram.org"
+  }
+}); // Отключаем polling, используем webhook
 
 // Настраиваем webhook
 const webhookPath = `/bot${TELEGRAM_TOKEN}`;
@@ -136,7 +145,7 @@ async function processQueue() {
     const me = await bot.getMe();
     console.log(`🤖 Бот активен: @${me.username}`);
   } catch (err) {
-    console.error('❌ Ошибка getMe:', err.message);
+    console.error('❌ Ошибка getMe: ', err.message);
   }
 })();
 
