@@ -18,22 +18,21 @@ if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не указан.');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { 
   polling: { 
-    interval: 2000, // Увеличен интервал для избежания 429 Too Many Requests
+    interval: 1000, // Уменьшен до 1 секунды, но не чаще, чтобы избежать 429
     autoStart: true,
-    params: { timeout: 10 } 
-  },
-  request: {
-    agentOptions: {
-      keepAlive: true,
-      family: 4
-    },
-    url: "https://api.telegram.org"
-  }
+    params: { timeout: 30 } // Увеличен timeout для long polling
+  } 
 });
 
-// Обработка polling ошибок для логов
+// Обработка polling ошибок и рестарт polling если фатал
 bot.on('polling_error', (error) => {
   console.log(`[polling_error] ${error.code}: ${error.message}`);
+  if (error.code === 'EFATAL' || error.message.includes('AggregateError') || error.message.includes('socket hang up')) {
+    console.log('🔄 Рестартую polling из-за фатальной ошибки...');
+    bot.stopPolling().then(() => {
+      setTimeout(() => bot.startPolling(), 5000); // Рестарт через 5 сек
+    });
+  }
 });
 
 // 📦 Очередь сообщений
