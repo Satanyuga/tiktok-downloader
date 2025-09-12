@@ -2,12 +2,16 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const fs = require('fs');
+const fs = require('fs'); // Оставляем на случай, если что-то пойдёт не так, но в основном не используем
 const path = require('path');
 
 // 🔧 Express сервер для Render
 const app = express();
 const PORT = process.env.PORT || 3000;
+const URL = 'https://' + process.env.RENDER_EXTERNAL_HOSTNAME;
+
+app.use(express.json()); // Обработка JSON-тела от Telegram
+
 app.get('/', (req, res) => res.send('🤖 Bot is alive'));
 app.get('/ping', (req, res) => res.send('✅ Ping OK'));
 app.listen(PORT, () => console.log(`🧠 Express слушает порт ${PORT}`));
@@ -16,7 +20,9 @@ app.listen(PORT, () => console.log(`🧠 Express слушает порт ${PORT}
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не указан.');
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+// ⚙️ Настраиваем Webhook
+const bot = new TelegramBot(TELEGRAM_TOKEN);
+bot.setWebHook(`${URL}/bot${TELEGRAM_TOKEN}`);
 
 // 📦 Очередь сообщений
 const queue = [];
@@ -24,12 +30,17 @@ let isProcessing = false;
 
 // ⏰ Пинг самого себя каждые 5 минут + лог
 setInterval(() => {
-  axios.get("https://tiktokbot-1100.onrender.com/ping")
+  axios.get(`${URL}/ping`)
     .then(() => console.log(`[${new Date().toLocaleTimeString()}] 🔄 Я не сплю. Пинганул Render.`))
     .catch(() => console.log(`[${new Date().toLocaleTimeString()}] ⚠️ Пинг не прошёл.`));
 }, 300000);
 
-// 📥 Обработка входящих сообщений
+// 📥 Обработка входящих сообщений от Webhook
+app.post(`/bot${TELEGRAM_TOKEN}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200); // Обязательно отвечаем, чтобы Telegram не спамил
+});
+
 bot.on('message', (msg) => {
   const chatId = msg.chat.id;
   const url = msg.text?.trim();
@@ -52,6 +63,7 @@ async function processQueue() {
     const { chatId, url } = queue.shift();
 
     try {
+      await bot.sendMessage(chatId, '🔎 Ищу твой контент...');
       // 🎬 Получаем данные с tikwm
       const { data } = await axios.get(`https://tikwm.com/api/?url=${encodeURIComponent(url)}`);
       const info = data?.data;
@@ -64,38 +76,14 @@ async function processQueue() {
 
         for (let i = 0; i < images.length; i++) {
           const imgUrl = images[i];
-          const filename = `img_${Date.now()}_${i}.jpg`;
-          const imgPath = path.resolve(__dirname, filename);
-
           const stream = await axios.get(imgUrl, { responseType: 'stream' });
-          const writer = fs.createWriteStream(imgPath);
-          stream.data.pipe(writer);
-
-          await new Promise((res, rej) => {
-            writer.on('finish', res);
-            writer.on('error', rej);
-          });
-
-          await bot.sendPhoto(chatId, imgPath);
-          fs.unlinkSync(imgPath);
+          await bot.sendPhoto(chatId, stream.data);
         }
 
       // 🎥 Обычное видео
       } else if (videoLink) {
-        const filename = `video_${Date.now()}.mp4`;
-        const videoPath = path.resolve(__dirname, filename);
-
         const stream = await axios.get(videoLink, { responseType: 'stream' });
-        const writer = fs.createWriteStream(videoPath);
-        stream.data.pipe(writer);
-
-        await new Promise((res, rej) => {
-          writer.on('finish', res);
-          writer.on('error', rej);
-        });
-
-        await bot.sendVideo(chatId, videoPath, { caption: '🎬 Вот твоё видео из TikTok' });
-        fs.unlinkSync(videoPath);
+        await bot.sendVideo(chatId, stream.data, { caption: '🎬 Вот твоё видео из TikTok' });
 
       } else {
         // ❌ Контент не найден
@@ -104,6 +92,7 @@ async function processQueue() {
 
     } catch (err) {
       // 🔥 Обработка ошибок
+      console.error(`Ошибка при обработке: ${err.message}`);
       await bot.sendMessage(chatId, `🔥 Ошибка: ${err.message}`);
     }
 
