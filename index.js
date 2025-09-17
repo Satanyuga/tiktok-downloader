@@ -18,18 +18,6 @@ if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не указан.');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// === ОДНОРАЗОВАЯ ПРОВЕРКА ДЛЯ УДАЛЕНИЯ WEBHOOK ===
-(async () => {
-    try {
-        await bot.deleteWebHook();
-        console.log('✅ Webhook успешно удален!');
-    } catch (e) {
-        console.error('❌ Не удалось удалить Webhook:', e.message);
-    }
-})();
-// ===============================================
-
-
 // 📦 Очередь сообщений
 const queue = [];
 let isProcessing = false;
