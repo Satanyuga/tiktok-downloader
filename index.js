@@ -52,36 +52,12 @@ async function processQueue() {
     const { chatId, url } = queue.shift();
 
     try {
-      // 🎬 Получаем данные с tikwm
-      const { data } = await axios.get(`https://tikwm.com/api/?url=${encodeURIComponent(url)}`);
-      const info = data?.data;
-      const videoLink = info?.play;
-      const images = info?.images;
-
-      // 🖼️ Карусель изображений
-      if (Array.isArray(images) && images.length > 0) {
-        await bot.sendMessage(chatId, `🖼️ Найдена галерея: ${images.length} изображений`);
-
-        for (let i = 0; i < images.length; i++) {
-          const imgUrl = images[i];
-          const filename = `img_${Date.now()}_${i}.jpg`;
-          const imgPath = path.resolve(__dirname, filename);
-
-          const stream = await axios.get(imgUrl, { responseType: 'stream' });
-          const writer = fs.createWriteStream(imgPath);
-          stream.data.pipe(writer);
-
-          await new Promise((res, rej) => {
-            writer.on('finish', res);
-            writer.on('error', rej);
-          });
-
-          await bot.sendPhoto(chatId, imgPath);
-          fs.unlinkSync(imgPath);
-        }
+      // 🎬 Получаем данные с нового сайта
+      const { data } = await axios.get(`https://api.ssstik.io/api/?url=${encodeURIComponent(url)}`);
+      const videoLink = data?.url;
 
       // 🎥 Обычное видео
-      } else if (videoLink) {
+      if (videoLink) {
         const filename = `video_${Date.now()}.mp4`;
         const videoPath = path.resolve(__dirname, filename);
 
@@ -104,12 +80,7 @@ async function processQueue() {
 
     } catch (err) {
       // 🔥 Обработка ошибок
-      if (err.response && err.response.status === 502) {
-          // Если 502, "падаем", чтобы Render перезапустил нас
-          console.error(`Критическая ошибка: ${err.message}. Бот будет перезапущен.`);
-          process.exit(1);
-      }
-      await bot.sendMessage(chatId, `🔥 Ошибка: ${err.message}`);
+      await bot.sendMessage(chatId, `🔥 Ошибка при скачивании: ${err.message}`);
     }
 
     // ⏱️ Задержка между запросами
@@ -137,9 +108,4 @@ process.once('SIGINT', () => {
 process.once('SIGTERM', () => {
   console.log('🔪 SIGTERM. Уничтожение...');
   process.exit(0);
-});
-
-// Добавлено: обработка ошибок polling, чтобы бот не падал
-bot.on('polling_error', (error) => {
-  console.error(`[polling_error] ${JSON.stringify(error)}`);
 });
