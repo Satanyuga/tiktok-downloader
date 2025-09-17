@@ -21,8 +21,8 @@ const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 // === АВТОМАТИЧЕСКАЯ ПРОВЕРКА И УДАЛЕНИЕ WEBHOOK ПРИ ЗАПУСКЕ ===
 (async () => {
     try {
-        const hasWebhook = await bot.getWebHookInfo();
-        if (hasWebhook.url) {
+        const webhookInfo = await bot.getWebHookInfo();
+        if (webhookInfo.url) {
             await bot.deleteWebHook();
             console.log('✅ Старый webhook был автоматически удален.');
         }
@@ -66,7 +66,7 @@ async function processQueue() {
     const { chatId, url } = queue.shift();
 
     try {
-      // 🎬 Получаем данные с нового сайта
+      // 🎬 Получаем данные с нового, рабочего сайта
       const { data } = await axios.get(`https://www.tikmate.app/api/json.php?url=${encodeURIComponent(url)}`);
       const videoLink = data?.video;
       const images = data?.images;
