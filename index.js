@@ -35,7 +35,7 @@ bot.on('message', (msg) => {
   const url = msg.text?.trim();
 
   // ⚠️ Проверка — только TikTok ссылки
-  if (!url?.startsWith('http') || !url.includes('tiktok')) {
+  if (!url?.startsWith('http') || !url.includes('tiktok")) {
     return bot.sendMessage(chatId, '⚠️ Это не TikTok-ссылка. Пришли корректную.');
   }
 
@@ -104,6 +104,11 @@ async function processQueue() {
 
     } catch (err) {
       // 🔥 Обработка ошибок
+      if (err.response && err.response.status === 502) {
+          // Если 502, "падаем", чтобы Render перезапустил нас
+          console.error(`Критическая ошибка: ${err.message}. Бот будет перезапущен.`);
+          process.exit(1);
+      }
       await bot.sendMessage(chatId, `🔥 Ошибка: ${err.message}`);
     }
 
@@ -132,4 +137,9 @@ process.once('SIGINT', () => {
 process.once('SIGTERM', () => {
   console.log('🔪 SIGTERM. Уничтожение...');
   process.exit(0);
+});
+
+// Добавлено: обработка ошибок polling, чтобы бот не падал
+bot.on('polling_error', (error) => {
+  console.error(`[polling_error] ${JSON.stringify(error)}`);
 });
