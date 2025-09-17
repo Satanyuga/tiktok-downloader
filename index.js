@@ -18,6 +18,20 @@ if (!TELEGRAM_TOKEN) throw new Error('❌ TELEGRAM_TOKEN не указан.');
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
+// === АВТОМАТИЧЕСКАЯ ПРОВЕРКА И УДАЛЕНИЕ WEBHOOK ПРИ ЗАПУСКЕ ===
+(async () => {
+    try {
+        const hasWebhook = await bot.getWebHookInfo();
+        if (hasWebhook.url) {
+            await bot.deleteWebHook();
+            console.log('✅ Старый webhook был автоматически удален.');
+        }
+    } catch (e) {
+        console.error('❌ Не удалось проверить/удалить Webhook:', e.message);
+    }
+})();
+// ===============================================
+
 // 📦 Очередь сообщений
 const queue = [];
 let isProcessing = false;
@@ -53,9 +67,9 @@ async function processQueue() {
 
     try {
       // 🎬 Получаем данные с нового сайта
-      const { data } = await axios.post('https://api-tiktok.com/api/', { url: url });
-      const videoLink = data?.data?.video_no_watermark;
-      const images = data?.data?.image;
+      const { data } = await axios.get(`https://www.tikmate.app/api/json.php?url=${encodeURIComponent(url)}`);
+      const videoLink = data?.video;
+      const images = data?.images;
 
       // 🖼️ Карусель изображений
       if (Array.isArray(images) && images.length > 0) {
@@ -78,6 +92,7 @@ async function processQueue() {
           await bot.sendPhoto(chatId, imgPath);
           fs.unlinkSync(imgPath);
         }
+
       } else if (videoLink) {
         const filename = `video_${Date.now()}.mp4`;
         const videoPath = path.resolve(__dirname, filename);
