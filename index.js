@@ -35,7 +35,7 @@ bot.on('message', (msg) => {
   const url = msg.text?.trim();
 
   // ⚠️ Проверка — только TikTok ссылки
-  if (!url?.startsWith('http') || !url.includes('tiktok")) {
+  if (!url?.startsWith('http') || !url.includes('tiktok')) {
     return bot.sendMessage(chatId, '⚠️ Это не TikTok-ссылка. Пришли корректную.');
   }
 
