@@ -4,18 +4,17 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
-// 🔧 Express для Render (чтобы не падал)
+// 🔧 Сервер (чтобы Render не убил процесс)
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('🤖 Бот работает'));
+app.get('/', (req, res) => res.send('🤖 Gatekeeper Active'));
 app.get('/ping', (req, res) => res.send('✅ OK'));
 app.listen(PORT, () => console.log(`🧠 Порт: ${PORT}`));
 
-// 🔐 Твои токены
+// 🔐 Токены и Настройки
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN; 
 
-// 📂 Данные твоего GitHub
 const REPO_OWNER = 'Satanyuga'; 
 const REPO_NAME = 'tiktok-downloader';
 const ALL_USERS_FILE = 'all_users.txt';
@@ -23,18 +22,35 @@ const BLACKLIST_FILE = 'blacklist.txt';
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
+// Локальные списки (Кэш)
 let BANNED_IDS = [];
+let ALLOWED_IDS = new Set(); // Те, кто уже прошел проверку
 
-// 🛡️ Функция обновления черного списка
-async function updateBlacklist() {
+// 🔄 Функция обновления списков с GitHub (читаем и друзей, и врагов)
+async function syncGitHubLists() {
+  const timestamp = Date.now();
+  
+  // 1. Обновляем Черный список
   try {
-    const url = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/${BLACKLIST_FILE}?t=${Date.now()}`;
-    const res = await axios.get(url);
+    const banUrl = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/${BLACKLIST_FILE}?t=${timestamp}`;
+    const res = await axios.get(banUrl);
     BANNED_IDS = res.data.split('\n').map(id => id.trim()).filter(id => id.length > 0);
-  } catch (err) { console.log('⚠️ Blacklist пока пуст или недоступен.'); }
+  } catch (err) { /* Файл еще не создан */ }
+
+  // 2. Обновляем Белый список (чтобы не мучить тех, кто уже в базе)
+  try {
+    const usersUrl = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/${ALL_USERS_FILE}?t=${timestamp}`;
+    const res = await axios.get(usersUrl);
+    const ids = res.data.split('\n')
+      .map(line => line.split('|')[0].replace('ID:', '').trim()) // Вытаскиваем только ID
+      .filter(id => id.length > 0);
+    
+    ids.forEach(id => ALLOWED_IDS.add(id));
+    console.log(`✅ Базы обновлены. В бане: ${BANNED_IDS.length}, Своих: ${ALLOWED_IDS.size}`);
+  } catch (err) { /* Файл еще не создан */ }
 }
 
-// 📝 Функция записи в "all_users.txt" на GitHub
+// 📝 Запись нового человека на GitHub
 async function writeToGithub(userId, userInfo) {
   const url = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${ALL_USERS_FILE}`;
   try {
@@ -50,29 +66,28 @@ async function writeToGithub(userId, userInfo) {
 
     const newContent = currentContent + userInfo + '\n';
     await axios.put(url, {
-      message: `👤 Авторизация: ${userId}`,
+      message: `👤 Новый человек: ${userId}`,
       content: Buffer.from(newContent).toString('base64'),
       sha: sha
     }, { headers: { Authorization: `token ${GITHUB_TOKEN}` } });
-    console.log(`✅ ID ${userId} записан на GitHub.`);
-  } catch (err) { console.error('❌ Ошибка записи на GitHub:', err.message); }
+    
+    console.log(`🚀 ${userId} сохранен в базу.`);
+  } catch (err) { console.error('❌ Ошибка записи:', err.message); }
 }
 
-// Запускаем обновление списка банов
-updateBlacklist();
-setInterval(updateBlacklist, 300000); // Каждые 5 минут
+// Запускаем синхронизацию при старте и каждые 5 минут
+syncGitHubLists();
+setInterval(syncGitHubLists, 300000);
+
+// Пинг самого себя
+setInterval(() => {
+  axios.get("https://tiktokbot-1100.onrender.com/ping").catch(() => {});
+}, 300000);
 
 const queue = [];
 let isProcessing = false;
 
-// ⏰ Пинг Render (чтобы не засыпал)
-setInterval(() => {
-  axios.get("https://tiktokbot-1100.onrender.com/ping")
-    .then(() => console.log(`[${new Date().toLocaleTimeString()}] 🔄 Пинг успешен.`))
-    .catch(() => {});
-}, 300000);
-
-// 🔄 Твои API для скачивания
+// 🔄 API для скачивания
 const APIs = [
   {
     name: 'tikwm',
@@ -91,38 +106,52 @@ const APIs = [
   }
 ];
 
-// 🔥 ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
+// 🔥 ГЛАВНЫЙ МОЗГ БОТА
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id.toString();
   const text = msg.text?.trim();
 
-  // 1. ПРОВЕРКА БАНА (Если в бане — сразу на выход)
+  // 1. ЧЕРНЫЙ СПИСОК (Самый строгий фильтр)
   if (BANNED_IDS.includes(userId)) {
-    return bot.sendMessage(chatId, `🚫 Доступ закрыт. Твой ID: ${userId}. Передай его владельцу.`);
+    return bot.sendMessage(chatId, `🚫 Доступ закрыт.`);
   }
 
-  // 2. АВТОРИЗАЦИЯ И СТАРТ
-  if (text === '/start' || text === '🔐 Авторизоваться') {
+  // 2. ПРОВЕРКА АВТОРИЗАЦИИ (Нажал ли кнопку?)
+  if (text === '🔐 Я человек') {
     const info = `ID: ${userId} | @${msg.from.username || 'no_nick'} | Name: ${msg.from.first_name}`;
-    await writeToGithub(userId, info); // Сдаем ID на Гитхаб
     
-    return bot.sendMessage(chatId, `👋 Привет! Твой ID: ${userId}\nНажми кнопку, чтобы я тебя запомнил, и кидай ссылку.`, {
-      reply_markup: { keyboard: [['🔐 Авторизоваться']], resize_keyboard: true }
+    // Записываем локально и на GitHub
+    ALLOWED_IDS.add(userId);
+    await writeToGithub(userId, info); 
+
+    return bot.sendMessage(chatId, `✅ Спасибо! Авторизация успешна. Присылай ссылки.`, {
+      reply_markup: { remove_keyboard: true } // Убираем кнопку
     });
   }
 
-  // 3. ПРОВЕРКА НА ССЫЛКУ (То, что ты просил вернуть!)
-  if (!text || !text.includes('tiktok.com')) {
-    return bot.sendMessage(chatId, '⚠️ Это не TikTok-ссылка. Пришли корректную ссылку на видео.');
+  // 3. ЕСЛИ ЧЕЛОВЕК НЕ В СПИСКЕ — ТРЕБУЕМ АВТОРИЗАЦИЮ
+  if (!ALLOWED_IDS.has(userId)) {
+    return bot.sendMessage(chatId, `Привет. Чтобы на бота не напали другие боты)\nПодтверди авторизацию, чтобы я знал, что ты человек. 👇`, {
+      reply_markup: {
+        keyboard: [['🔐 Я человек']], // Большая кнопка
+        resize_keyboard: true,
+        one_time_keyboard: true
+      }
+    });
   }
 
-  // 4. ДОБАВЛЕНИЕ В ОЧЕРЕДЬ
-  queue.push({ chatId, url: text });
-  if (!isProcessing) processQueue();
+  // 4. ОБРАБОТКА ССЫЛОК (Только для своих)
+  if (text?.includes('tiktok.com')) {
+    queue.push({ chatId, url: text });
+    if (!isProcessing) processQueue();
+  } else {
+    // Если прислали просто текст, но авторизация уже пройдена
+    bot.sendMessage(chatId, '⚠️ Это не ссылка на TikTok. Пришли ссылку на видео.');
+  }
 });
 
-// ⚙️ Обработка очереди скачивания
+// ⚙️ Очередь скачивания
 async function tryDownload(url) {
   for (const api of APIs) {
     try {
@@ -133,7 +162,7 @@ async function tryDownload(url) {
       if (result.videoLink || result.images) return result;
     } catch (e) { continue; }
   }
-  throw new Error('Все API недоступны');
+  throw new Error('API Fail');
 }
 
 async function processQueue() {
@@ -143,26 +172,21 @@ async function processQueue() {
     try {
       const { videoLink, images } = await tryDownload(url);
       
-      // Если это картинки
       if (Array.isArray(images) && images.length > 0) {
-        await bot.sendMessage(chatId, `🖼️ Найдена галерея: ${images.length} фото`);
+        await bot.sendMessage(chatId, `🖼️ Фото-карусель: ${images.length} шт.`);
         for (const imgUrl of images) await bot.sendPhoto(chatId, imgUrl);
-      } 
-      // Если это видео
-      else if (videoLink) {
+      } else if (videoLink) {
         const videoPath = path.resolve(__dirname, `v_${Date.now()}.mp4`);
         const res = await axios.get(videoLink, { responseType: 'stream' });
         const writer = fs.createWriteStream(videoPath);
         res.data.pipe(writer);
         await new Promise(r => writer.on('finish', r));
-        await bot.sendVideo(chatId, videoPath, { caption: '🎬 Твое видео' });
+        await bot.sendVideo(chatId, videoPath, { caption: '🎬 Готово' });
         if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
       } else {
-        bot.sendMessage(chatId, '📭 Контент не найден.');
+        bot.sendMessage(chatId, '📭 Контент не доступен.');
       }
-    } catch (err) { 
-      bot.sendMessage(chatId, '🔥 Ошибка: Не удалось скачать контент.'); 
-    }
+    } catch (err) { bot.sendMessage(chatId, '⚠️ Не удалось скачать.'); }
     await new Promise(r => setTimeout(r, 2000));
   }
   isProcessing = false;
