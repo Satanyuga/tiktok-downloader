@@ -21,6 +21,15 @@ const BLACKLIST_FILE = 'blacklist.txt';
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
+// Страховка: одна неожиданная ошибка (например, необычный формат ответа от API)
+// не должна ронять ВЕСЬ процесс и отключать бота для всех пользователей разом.
+process.on('uncaughtException', (err) => {
+  console.error('💥 uncaughtException (бот продолжает работать):', err);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('💥 unhandledRejection (бот продолжает работать):', err);
+});
+
 // 409 Conflict = где-то ЕЩЁ работает второй polling-инстанс с этим же токеном
 // (старый деплой на Render не остановился, или бот запущен локально/на другом сервисе).
 // Сам по себе процесс это не чинит — нужно погасить второй инстанс руками.
@@ -115,6 +124,9 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const MAX_ATTEMPTS = VERSIONS.length;
 const RETRY_DELAY_MS = 5000;
 
+// Ловит ссылки вида vt.tiktok.com/..., vm.tiktok.com/..., www.tiktok.com/@user/video/...
+const TIKTOK_URL_REGEX = /https?:\/\/(?:[\w-]+\.)?tiktok\.com\/\S+/gi;
+
 // 🔄 ГЛАВНЫЙ ОБРАБОТЧИК
 bot.on('message', async (msg) => {
   if (!msg.from) return;
@@ -151,9 +163,11 @@ bot.on('message', async (msg) => {
     });
   }
 
-  // 4. РАБОТА СО ССЫЛКАМИ
-  if (text?.includes('tiktok.com')) {
-    queue.push({ chatId, url: text });
+  // 4. РАБОТА СО ССЫЛКАМИ — достаём ВСЕ tiktok-ссылки из сообщения (их может быть несколько,
+  // например при пересылке нескольких сообщений одним блоком) и добавляем каждую отдельно.
+  const links = text ? text.match(TIKTOK_URL_REGEX) : null;
+  if (links && links.length) {
+    for (const link of links) queue.push({ chatId, url: link });
     if (!isProcessing) processQueue();
   } else if (text !== '/start') {
     bot.sendMessage(chatId, '⚠️ Пришли ссылку на TikTok-видео.');
@@ -221,8 +235,8 @@ async function downloadWithRetry(chatId, url) {
       return; // успех — выходим
     } catch (err) {
       const detail = err.response
-        ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data).slice(0, 200)}`
-        : err.message;
+        ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data ?? null).slice(0, 200)}`
+        : (err.message || String(err));
       console.error(`❌ Ошибка загрузки [попытка ${attempt}/${MAX_ATTEMPTS}] ${url} — ${detail}`);
 
       if (attempt < MAX_ATTEMPTS) {
