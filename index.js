@@ -95,6 +95,13 @@ setInterval(() => {
 const queue = [];
 let isProcessing = false;
 
+// tikwm иногда рвёт соединение / банит запрос без UA — поэтому шлём как браузер.
+// Чередуем tikwm.com и www.tikwm.com между попытками — так реже ловим бан по IP рендера.
+const TIKWM_HOSTS = ['https://www.tikwm.com', 'https://tikwm.com'];
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+const MAX_ATTEMPTS = 3;
+const RETRY_DELAY_MS = 5000;
+
 // 🔄 ГЛАВНЫЙ ОБРАБОТЧИК
 bot.on('message', async (msg) => {
   if (!msg.from) return;
@@ -140,25 +147,65 @@ bot.on('message', async (msg) => {
   }
 });
 
+// Один заход: спросить у tikwm инфу по ссылке и отправить результат.
+// Бросает исключение, если что-то пошло не так (сеть, пустой ответ, ошибка отправки в TG).
+async function fetchAndSend(chatId, url, attempt) {
+  const host = TIKWM_HOSTS[(attempt - 1) % TIKWM_HOSTS.length];
+  const apiUrl = `${host}/api/?url=${encodeURIComponent(url)}`;
+
+  const res = await axios.get(apiUrl, {
+    timeout: 15000,
+    headers: { 'User-Agent': UA, 'Referer': 'https://www.tikwm.com/' }
+  });
+
+  const data = res.data?.data;
+  if (!data || (!data.images && !data.play)) {
+    // Настоящая причина отказа — видна в логах вместо бесполезного "Ошибка загрузки"
+    throw new Error(`tikwm(${host}) пустой ответ: code=${res.data?.code}, msg=${res.data?.msg}`);
+  }
+
+  if (data.images) {
+    for (const imgUrl of data.images) await bot.sendPhoto(chatId, imgUrl);
+  } else if (data.play) {
+    const videoPath = path.resolve(__dirname, `v_${Date.now()}_${attempt}.mp4`);
+    const vRes = await axios.get(data.play, { responseType: 'stream', timeout: 30000, headers: { 'User-Agent': UA } });
+    const writer = fs.createWriteStream(videoPath);
+    vRes.data.pipe(writer);
+    await new Promise((resolve, reject) => {
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+    });
+    await bot.sendVideo(chatId, videoPath);
+    if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+  }
+}
+
+// Проверяет и, если нужно, ПОВТОРЯЕТ попытку сама — без ручной пересылки ссылки юзером.
+async function downloadWithRetry(chatId, url) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      await fetchAndSend(chatId, url, attempt);
+      return; // успех — выходим
+    } catch (err) {
+      const detail = err.response
+        ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data).slice(0, 200)}`
+        : err.message;
+      console.error(`❌ Ошибка загрузки [попытка ${attempt}/${MAX_ATTEMPTS}] ${url} — ${detail}`);
+
+      if (attempt < MAX_ATTEMPTS) {
+        await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+      } else {
+        bot.sendMessage(chatId, '⚠️ Не получилось скачать видео после нескольких попыток. Попробуй ещё раз чуть позже.');
+      }
+    }
+  }
+}
+
 async function processQueue() {
   isProcessing = true;
   while (queue.length > 0) {
     const { chatId, url } = queue.shift();
-    try {
-      const res = await axios.get(`https://tikwm.com/api/?url=${encodeURIComponent(url)}`);
-      const data = res.data.data;
-      if (data?.images) {
-        for (const imgUrl of data.images) await bot.sendPhoto(chatId, imgUrl);
-      } else if (data?.play) {
-        const videoPath = path.resolve(__dirname, `v_${Date.now()}.mp4`);
-        const vRes = await axios.get(data.play, { responseType: 'stream' });
-        const writer = fs.createWriteStream(videoPath);
-        vRes.data.pipe(writer);
-        await new Promise(r => writer.on('finish', r));
-        await bot.sendVideo(chatId, videoPath);
-        if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
-      }
-    } catch (err) { console.log('Ошибка загрузки'); }
+    await downloadWithRetry(chatId, url);
     await new Promise(r => setTimeout(r, 2000));
   }
   isProcessing = false;
