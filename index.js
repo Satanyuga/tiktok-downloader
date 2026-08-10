@@ -117,12 +117,20 @@ const queue = [];
 let isProcessing = false;
 
 // tikwm.com банит IP хостингов (Render/AWS/итд) — обычный ретрай туда же бессмысленен.
-// Поэтому пробуем НЕЗАВИСИМЫЕ провайдеры по очереди: v1=tikwm, v2=ssstik, v3=musicaldown.
-// Если один забанен/лежит — велик шанс, что другой отработает.
+// Поэтому опрашиваем НЕЗАВИСИМЫЕ провайдеры ПАРАЛЛЕЛЬНО: v1=tikwm, v2=ssstik, v3=musicaldown.
+// Если один забанен/лежит — используем того, кто ответит первым успехом.
 const VERSIONS = ['v1', 'v2', 'v3'];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-const MAX_ATTEMPTS = VERSIONS.length;
-const RETRY_DELAY_MS = 5000;
+// У каждого провайдера свой CDN — некоторые отдают видео только с "правильным" Referer,
+// а без него подсовывают HTML-заглушку вместо настоящего mp4 (отсюда "битые" видео-документы).
+const REFERERS = {
+  v1: 'https://www.tikwm.com/',
+  v2: 'https://ssstik.io/',
+  v3: 'https://musicaldown.com/'
+};
+// Сколько ссылок скачиваем ОДНОВРЕМЕННО — раньше было 1, отсюда и "трюльками по одной раз в 5 минут".
+const CONCURRENCY = 3;
+const RETRY_ROUNDS = 2; // сколько раз повторить полный круг по всем провайдерам, если все отказали
 
 // Ловит ссылки вида vt.tiktok.com/..., vm.tiktok.com/..., www.tiktok.com/@user/video/...
 const TIKTOK_URL_REGEX = /https?:\/\/(?:[\w-]+\.)?tiktok\.com\/\S+/gi;
@@ -167,7 +175,11 @@ bot.on('message', async (msg) => {
   // например при пересылке нескольких сообщений одним блоком) и добавляем каждую отдельно.
   const links = text ? text.match(TIKTOK_URL_REGEX) : null;
   if (links && links.length) {
-    for (const link of links) queue.push({ chatId, url: link });
+    for (const link of links) {
+      // Статус-сообщение сразу — юзер видит, что ссылка принята и бот уже работает.
+      const statusMsg = await bot.sendMessage(chatId, '⏳ Скачиваю видео...');
+      queue.push({ chatId, url: link, statusMsgId: statusMsg.message_id });
+    }
     if (!isProcessing) processQueue();
   } else if (text !== '/start') {
     bot.sendMessage(chatId, '⚠️ Пришли ссылку на TikTok-видео.');
@@ -196,64 +208,108 @@ function extractMedia(version, result) {
   return null;
 }
 
-// Один заход: спросить у очередного провайдера инфу по ссылке и отправить результат.
-// Бросает исключение, если что-то пошло не так (сеть, пустой ответ, ошибка отправки в TG).
-async function fetchAndSend(chatId, url, attempt) {
-  const version = VERSIONS[(attempt - 1) % VERSIONS.length];
-
+// Спрашивает у ОДНОГО конкретного провайдера ссылку на медиа (без скачивания и отправки).
+async function fetchMedia(url, version) {
   const res = await TiktokDL.Downloader(url, { version });
   if (res.status !== 'success' || !res.result) {
     throw new Error(`tiktok-dl(${version}) отказ: ${res.message || 'без сообщения'}`);
   }
-
   const media = extractMedia(version, res.result);
-  if (!media) {
-    throw new Error(`tiktok-dl(${version}) не нашёл медиа в ответе`);
-  }
+  if (!media) throw new Error(`tiktok-dl(${version}) не нашёл медиа в ответе`);
+  return { version, media };
+}
 
-  if (media.images) {
-    for (const imgUrl of media.images) await bot.sendPhoto(chatId, imgUrl);
-  } else {
-    const videoPath = path.resolve(__dirname, `v_${Date.now()}_${attempt}.mp4`);
-    const vRes = await axios.get(media.video, { responseType: 'stream', timeout: 30000, headers: { 'User-Agent': UA } });
-    const writer = fs.createWriteStream(videoPath);
-    vRes.data.pipe(writer);
-    await new Promise((resolve, reject) => {
-      writer.on('finish', resolve);
-      writer.on('error', reject);
-    });
-    await bot.sendVideo(chatId, videoPath);
-    if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+// Опрашивает ВСЕ провайдеры ПАРАЛЛЕЛЬНО — используем того, кто первым ответил успехом.
+// Это сильно быстрее последовательного перебора: не ждём таймаут/бан одного, чтобы пойти к следующему.
+async function fetchMediaAnyProvider(url) {
+  const attempts = VERSIONS.map(v => fetchMedia(url, v));
+  try {
+    return await Promise.any(attempts);
+  } catch (aggErr) {
+    const details = (aggErr.errors || [aggErr]).map(e => e.message).join(' | ');
+    throw new Error(`все провайдеры отказали: ${details}`);
   }
 }
 
-// Проверяет и, если нужно, ПОВТОРЯЕТ попытку сама — без ручной пересылки ссылки юзером.
-async function downloadWithRetry(chatId, url) {
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      await fetchAndSend(chatId, url, attempt);
-      return; // успех — выходим
-    } catch (err) {
-      const detail = err.response
-        ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data ?? null).slice(0, 200)}`
-        : (err.message || String(err));
-      console.error(`❌ Ошибка загрузки [попытка ${attempt}/${MAX_ATTEMPTS}] ${url} — ${detail}`);
+// Скачивает файл по ссылке и проверяет, что это ДЕЙСТВИТЕЛЬНО видео, а не HTML-заглушка
+// (некоторые CDN без правильного Referer отдают страницу "доступ запрещён" вместо mp4 —
+// именно из-за этого часть видео раньше приходила "битым документом" без превью).
+async function downloadAndValidate(mediaUrl, version, destPath) {
+  const vRes = await axios.get(mediaUrl, {
+    responseType: 'stream',
+    timeout: 30000,
+    headers: { 'User-Agent': UA, 'Referer': REFERERS[version] || '' }
+  });
 
-      if (attempt < MAX_ATTEMPTS) {
-        await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
-      } else {
-        bot.sendMessage(chatId, '⚠️ Не получилось скачать видео после нескольких попыток. Попробуй ещё раз чуть позже.');
+  const contentType = vRes.headers['content-type'] || '';
+  if (contentType && !contentType.startsWith('video') && !contentType.includes('octet-stream')) {
+    throw new Error(`${version}: сервер отдал не видео (content-type: ${contentType})`);
+  }
+
+  const writer = fs.createWriteStream(destPath);
+  vRes.data.pipe(writer);
+  await new Promise((resolve, reject) => {
+    writer.on('finish', resolve);
+    writer.on('error', reject);
+  });
+
+  const size = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0;
+  if (size < 20000) { // меньше ~20KB — почти наверняка не настоящее видео, а заглушка/ошибка
+    if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+    throw new Error(`${version}: подозрительно маленький файл (${size} байт), похоже на заглушку`);
+  }
+}
+
+// Один полный круг: спросить у провайдеров (параллельно) и отправить результат в Telegram.
+async function fetchAndSend(chatId, url, roundAttempt) {
+  const { version, media } = await fetchMediaAnyProvider(url);
+
+  if (media.images) {
+    for (const imgUrl of media.images) await bot.sendPhoto(chatId, imgUrl);
+    return;
+  }
+
+  const videoPath = path.resolve(__dirname, `v_${Date.now()}_${roundAttempt}.mp4`);
+  await downloadAndValidate(media.video, version, videoPath);
+  // filename/contentType — чтобы Telegram точно распознал файл как проигрываемое видео,
+  // а не как "документ, надо скачать" (см. deprecation-warning про default content-type).
+  await bot.sendVideo(chatId, videoPath, { supports_streaming: true }, { filename: 'video.mp4', contentType: 'video/mp4' });
+  if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+}
+
+// Повторяет ПОЛНЫЙ круг по всем провайдерам ещё раз, если с первого захода не вышло.
+// Управляет статус-сообщением: удаляет его при успехе, показывает ошибку при полном отказе.
+async function downloadWithRetry(chatId, url, statusMsgId) {
+  for (let round = 1; round <= RETRY_ROUNDS; round++) {
+    try {
+      await fetchAndSend(chatId, url, round);
+      if (statusMsgId) bot.deleteMessage(chatId, statusMsgId).catch(() => {});
+      return;
+    } catch (err) {
+      console.error(`❌ Ошибка загрузки [круг ${round}/${RETRY_ROUNDS}] ${url} — ${err.message || err}`);
+      if (round === RETRY_ROUNDS) {
+        const failText = '⚠️ Не получилось скачать это видео. Попробуй ещё раз чуть позже.';
+        if (statusMsgId) {
+          bot.editMessageText(failText, { chat_id: chatId, message_id: statusMsgId }).catch(() => bot.sendMessage(chatId, failText));
+        } else {
+          bot.sendMessage(chatId, failText);
+        }
       }
     }
   }
 }
 
+// Обрабатывает очередь несколькими "воркерами" параллельно вместо строго одной ссылки за раз.
+async function worker() {
+  while (queue.length > 0) {
+    const item = queue.shift();
+    if (!item) return;
+    await downloadWithRetry(item.chatId, item.url, item.statusMsgId);
+  }
+}
+
 async function processQueue() {
   isProcessing = true;
-  while (queue.length > 0) {
-    const { chatId, url } = queue.shift();
-    await downloadWithRetry(chatId, url);
-    await new Promise(r => setTimeout(r, 2000));
-  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
   isProcessing = false;
 }
