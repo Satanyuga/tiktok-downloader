@@ -3,6 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const TiktokDL = require('@tobyg74/tiktok-api-dl');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,6 +20,17 @@ const ALL_USERS_FILE = 'all_users.txt';
 const BLACKLIST_FILE = 'blacklist.txt';
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+
+// 409 Conflict = где-то ЕЩЁ работает второй polling-инстанс с этим же токеном
+// (старый деплой на Render не остановился, или бот запущен локально/на другом сервисе).
+// Сам по себе процесс это не чинит — нужно погасить второй инстанс руками.
+bot.on('polling_error', (error) => {
+  if (error.code === 'ETELEGRAM' && /409/.test(error.message)) {
+    console.error('⚠️ 409 Conflict: где-то работает ещё один инстанс бота с этим токеном. Проверь Render (старые деплои/сервисы) и локальные запуски.');
+  } else {
+    console.error('⚠️ polling_error:', error.code, error.message);
+  }
+});
 
 let BANNED_IDS = new Set();
 let ALLOWED_IDS = new Set();
@@ -95,11 +107,12 @@ setInterval(() => {
 const queue = [];
 let isProcessing = false;
 
-// tikwm иногда рвёт соединение / банит запрос без UA — поэтому шлём как браузер.
-// Чередуем tikwm.com и www.tikwm.com между попытками — так реже ловим бан по IP рендера.
-const TIKWM_HOSTS = ['https://www.tikwm.com', 'https://tikwm.com'];
+// tikwm.com банит IP хостингов (Render/AWS/итд) — обычный ретрай туда же бессмысленен.
+// Поэтому пробуем НЕЗАВИСИМЫЕ провайдеры по очереди: v1=tikwm, v2=ssstik, v3=musicaldown.
+// Если один забанен/лежит — велик шанс, что другой отработает.
+const VERSIONS = ['v1', 'v2', 'v3'];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = VERSIONS.length;
 const RETRY_DELAY_MS = 5000;
 
 // 🔄 ГЛАВНЫЙ ОБРАБОТЧИК
@@ -147,28 +160,48 @@ bot.on('message', async (msg) => {
   }
 });
 
-// Один заход: спросить у tikwm инфу по ссылке и отправить результат.
-// Бросает исключение, если что-то пошло не так (сеть, пустой ответ, ошибка отправки в TG).
-async function fetchAndSend(chatId, url, attempt) {
-  const host = TIKWM_HOSTS[(attempt - 1) % TIKWM_HOSTS.length];
-  const apiUrl = `${host}/api/?url=${encodeURIComponent(url)}`;
+// Достаёт ссылку(и) на медиа из ответа, формат которого отличается между версиями API.
+function extractMedia(version, result) {
+  if (!result) return null;
 
-  const res = await axios.get(apiUrl, {
-    timeout: 15000,
-    headers: { 'User-Agent': UA, 'Referer': 'https://www.tikwm.com/' }
-  });
-
-  const data = res.data?.data;
-  if (!data || (!data.images && !data.play)) {
-    // Настоящая причина отказа — видна в логах вместо бесполезного "Ошибка загрузки"
-    throw new Error(`tikwm(${host}) пустой ответ: code=${res.data?.code}, msg=${res.data?.msg}`);
+  if (result.type === 'image' && result.images?.length) {
+    return { images: result.images };
   }
 
-  if (data.images) {
-    for (const imgUrl of data.images) await bot.sendPhoto(chatId, imgUrl);
-  } else if (data.play) {
+  let videoUrl = null;
+  if (version === 'v1') { // tikwm
+    videoUrl = result.video?.playAddr?.[0] || result.video?.downloadAddr?.[0];
+  } else if (version === 'v2') { // ssstik
+    videoUrl = result.video?.playAddr || result.direct;
+  } else if (version === 'v3') { // musicaldown
+    videoUrl = result.videoHD || result.videoWatermark;
+  }
+
+  if (videoUrl) return { video: videoUrl };
+  if (result.images?.length) return { images: result.images }; // на случай type не проставлен
+  return null;
+}
+
+// Один заход: спросить у очередного провайдера инфу по ссылке и отправить результат.
+// Бросает исключение, если что-то пошло не так (сеть, пустой ответ, ошибка отправки в TG).
+async function fetchAndSend(chatId, url, attempt) {
+  const version = VERSIONS[(attempt - 1) % VERSIONS.length];
+
+  const res = await TiktokDL.Downloader(url, { version });
+  if (res.status !== 'success' || !res.result) {
+    throw new Error(`tiktok-dl(${version}) отказ: ${res.message || 'без сообщения'}`);
+  }
+
+  const media = extractMedia(version, res.result);
+  if (!media) {
+    throw new Error(`tiktok-dl(${version}) не нашёл медиа в ответе`);
+  }
+
+  if (media.images) {
+    for (const imgUrl of media.images) await bot.sendPhoto(chatId, imgUrl);
+  } else {
     const videoPath = path.resolve(__dirname, `v_${Date.now()}_${attempt}.mp4`);
-    const vRes = await axios.get(data.play, { responseType: 'stream', timeout: 30000, headers: { 'User-Agent': UA } });
+    const vRes = await axios.get(media.video, { responseType: 'stream', timeout: 30000, headers: { 'User-Agent': UA } });
     const writer = fs.createWriteStream(videoPath);
     vRes.data.pipe(writer);
     await new Promise((resolve, reject) => {
