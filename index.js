@@ -4,6 +4,8 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const TiktokDL = require('@tobyg74/tiktok-api-dl');
+const ffmpegPath = require('ffmpeg-static');
+const { spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -131,6 +133,8 @@ const REFERERS = {
 // Сколько ссылок скачиваем ОДНОВРЕМЕННО — раньше было 1, отсюда и "трюльками по одной раз в 5 минут".
 const CONCURRENCY = 3;
 const RETRY_ROUNDS = 2; // сколько раз повторить полный круг по всем провайдерам, если все отказали
+// Telegram Bot API режет загрузку файлов на 50MB — берём с запасом.
+const MAX_TELEGRAM_BYTES = 49 * 1024 * 1024;
 
 // Ловит ссылки вида vt.tiktok.com/..., vm.tiktok.com/..., www.tiktok.com/@user/video/...
 const TIKTOK_URL_REGEX = /https?:\/\/(?:[\w-]+\.)?tiktok\.com\/\S+/gi;
@@ -260,8 +264,85 @@ async function downloadAndValidate(mediaUrl, version, destPath) {
   }
 }
 
+// Запускает ffmpeg и всегда резолвит с {code, stderr} — не бросает исключение на ненулевом коде,
+// это нужно и для обычных команд, и для "пробы" длительности видео (см. ниже).
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, args);
+    let stderr = '';
+    proc.stderr.on('data', d => { stderr += d; });
+    proc.on('error', reject);
+    proc.on('close', code => resolve({ code, stderr }));
+  });
+}
+
+// Узнаём длительность видео без полного декодирования — ffmpeg печатает "Duration: HH:MM:SS.xx"
+// в stderr ещё до того, как ругнётся на отсутствие выходного файла.
+async function probeDurationSeconds(input) {
+  const { stderr } = await runFfmpeg(['-i', input]);
+  const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  return (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+}
+
+// Перекладывает контейнер (moov atom в начало) БЕЗ перекодирования — мгновенно и без потери качества.
+// Чинит конкретный баг: некоторые провайдеры отдают mp4, в котором Telegram не видит длительность/превью
+// и показывает видео как "файл, надо скачать" вместо проигрываемого ролика.
+async function remux(input, output) {
+  const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
+  if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
+}
+
+// Сжимает ПОД ТОЧНЫЙ РАЗМЕР — считаем битрейт из длительности видео и целевого размера,
+// вместо того чтобы вслепую понижать разрешение. Разрешение остаётся оригинальным —
+// это даёт заметно лучшее качество на тот же вес, чем фиксированный crf+downscale.
+async function compressToFit(input, output, targetBytes) {
+  const duration = (await probeDurationSeconds(input)) || 180; // не смогли определить — считаем как 3 мин (перестрахуемся)
+  const audioKbps = 128;
+  const safetyMargin = 0.93; // запас под накладные расходы контейнера и пики битрейта
+  let videoKbps = Math.floor((targetBytes * 8 / 1024 / duration) * safetyMargin - audioKbps);
+  if (videoKbps < 300) videoKbps = 300; // ниже уже совсем плохо будет выглядеть, но это край случая для очень длинных роликов
+
+  const { code, stderr } = await runFfmpeg([
+    '-y', '-i', input,
+    '-c:v', 'libx264', '-preset', 'medium', // medium вместо veryfast — заметно лучше качество на тот же битрейт
+    '-b:v', `${videoKbps}k`, '-maxrate', `${Math.floor(videoKbps * 1.2)}k`, '-bufsize', `${videoKbps * 2}k`,
+    '-c:a', 'aac', '-b:a', `${audioKbps}k`,
+    '-movflags', '+faststart',
+    output
+  ]);
+  if (code !== 0) throw new Error(`compress exit ${code}: ${stderr.slice(-300)}`);
+}
+
+// Сжимает ТОЛЬКО если файл реально больше лимита Telegram. Маленькие видео эта функция не трогает вообще.
+async function ensureUnderTelegramLimit(inputPath, chatId, statusMsgId) {
+  const size = fs.statSync(inputPath).size;
+  if (size <= MAX_TELEGRAM_BYTES) return inputPath;
+
+  console.log(`⚙️ Видео ${(size / 1024 / 1024).toFixed(1)}MB больше лимита ${(MAX_TELEGRAM_BYTES / 1024 / 1024).toFixed(0)}MB — сжимаю под точный размер...`);
+  if (statusMsgId) {
+    bot.editMessageText('📦 Видео не влезает по размеру, сжимаю без потери качества...', { chat_id: chatId, message_id: statusMsgId }).catch(() => {});
+  }
+
+  const outPath = inputPath.replace(/\.mp4$/, '') + '_fit.mp4';
+  await compressToFit(inputPath, outPath, MAX_TELEGRAM_BYTES);
+
+  if (fs.statSync(outPath).size > MAX_TELEGRAM_BYTES) {
+    // Расчёт битрейта — оценка (VBR пики, реальный muxing overhead), иногда чуть промахивается.
+    // Один дожим с меньшим запасом — и всё, дальше не гоняем по кругу до бесконечности.
+    const outPath2 = inputPath.replace(/\.mp4$/, '') + '_fit2.mp4';
+    await compressToFit(outPath, outPath2, Math.floor(MAX_TELEGRAM_BYTES * 0.88));
+    fs.unlinkSync(outPath);
+    if (statusMsgId) bot.editMessageText('✅ Сжато, отправляю...', { chat_id: chatId, message_id: statusMsgId }).catch(() => {});
+    return outPath2;
+  }
+
+  if (statusMsgId) bot.editMessageText('✅ Сжато, отправляю...', { chat_id: chatId, message_id: statusMsgId }).catch(() => {});
+  return outPath;
+}
+
 // Один полный круг: спросить у провайдеров (параллельно) и отправить результат в Telegram.
-async function fetchAndSend(chatId, url, roundAttempt) {
+async function fetchAndSend(chatId, url, roundAttempt, statusMsgId) {
   const { version, media } = await fetchMediaAnyProvider(url);
 
   if (media.images) {
@@ -271,10 +352,21 @@ async function fetchAndSend(chatId, url, roundAttempt) {
 
   const videoPath = path.resolve(__dirname, `v_${Date.now()}_${roundAttempt}.mp4`);
   await downloadAndValidate(media.video, version, videoPath);
-  // filename/contentType — чтобы Telegram точно распознал файл как проигрываемое видео,
-  // а не как "документ, надо скачать" (см. deprecation-warning про default content-type).
-  await bot.sendVideo(chatId, videoPath, { supports_streaming: true }, { filename: 'video.mp4', contentType: 'video/mp4' });
-  if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+
+  // Всегда чиним контейнер (faststart) — без этого часть видео Telegram показывает
+  // как "файл, нужно скачать" вместо проигрываемого ролика. Это ремукс, не перекодирование:
+  // быстро и без малейшей потери качества.
+  const remuxedPath = videoPath.replace(/\.mp4$/, '') + '_r.mp4';
+  await remux(videoPath, remuxedPath);
+  fs.unlinkSync(videoPath);
+
+  const sendPath = await ensureUnderTelegramLimit(remuxedPath, chatId, statusMsgId);
+
+  // filename/contentType — чтобы Telegram точно распознал файл как проигрываемое видео.
+  await bot.sendVideo(chatId, sendPath, { supports_streaming: true }, { filename: 'video.mp4', contentType: 'video/mp4' });
+
+  if (fs.existsSync(remuxedPath)) fs.unlinkSync(remuxedPath);
+  if (sendPath !== remuxedPath && fs.existsSync(sendPath)) fs.unlinkSync(sendPath);
 }
 
 // Повторяет ПОЛНЫЙ круг по всем провайдерам ещё раз, если с первого захода не вышло.
@@ -282,7 +374,7 @@ async function fetchAndSend(chatId, url, roundAttempt) {
 async function downloadWithRetry(chatId, url, statusMsgId) {
   for (let round = 1; round <= RETRY_ROUNDS; round++) {
     try {
-      await fetchAndSend(chatId, url, round);
+      await fetchAndSend(chatId, url, round, statusMsgId);
       if (statusMsgId) bot.deleteMessage(chatId, statusMsgId).catch(() => {});
       return;
     } catch (err) {
