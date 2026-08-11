@@ -294,8 +294,8 @@ async function remux(input, output) {
 }
 
 // Сжимает ПОД ТОЧНЫЙ РАЗМЕР — считаем битрейт из длительности видео и целевого размера,
-// вместо того чтобы вслепую понижать разрешение. Разрешение остаётся оригинальным —
-// это даёт заметно лучшее качество на тот же вес, чем фиксированный crf+downscale.
+// вместо того чтобы вслепую понижать разрешение. Разрешение почти всегда остаётся оригинальным
+// (кап только на аномально широких видео — иначе x264 на маленьком сервере может съесть всю память).
 async function compressToFit(input, output, targetBytes) {
   const duration = (await probeDurationSeconds(input)) || 180; // не смогли определить — считаем как 3 мин (перестрахуемся)
   const audioKbps = 128;
@@ -305,13 +305,24 @@ async function compressToFit(input, output, targetBytes) {
 
   const { code, stderr } = await runFfmpeg([
     '-y', '-i', input,
-    '-c:v', 'libx264', '-preset', 'medium', // medium вместо veryfast — заметно лучше качество на тот же битрейт
+    '-vf', "scale='min(960,iw)':'min(960,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", // кап по БОЛЬШЕЙ стороне — важно для вертикальных tiktok-видео (1080x1920), иначе память не ограничивается вообще
+    '-c:v', 'libx264', '-preset', 'veryfast', '-threads', '1', // минимум памяти — сервис уже падал в OOM, тут лучше перестраховаться, чем красиво
     '-b:v', `${videoKbps}k`, '-maxrate', `${Math.floor(videoKbps * 1.2)}k`, '-bufsize', `${videoKbps * 2}k`,
     '-c:a', 'aac', '-b:a', `${audioKbps}k`,
     '-movflags', '+faststart',
     output
   ]);
   if (code !== 0) throw new Error(`compress exit ${code}: ${stderr.slice(-300)}`);
+}
+
+// Сжатие (в отличие от remux) реально прожорливо по памяти. Если 2-3 сжатия пойдут ОДНОВРЕМЕННО
+// (при concurrency-очереди это возможно), инстанс на Render может уйти в OOM и упасть целиком.
+// Поэтому сжатия выполняются строго ПО ОДНОМУ, независимо от того, сколько видео качается параллельно.
+let compressionChain = Promise.resolve();
+function runCompressionExclusive(fn) {
+  const result = compressionChain.then(fn, fn);
+  compressionChain = result.then(() => {}, () => {}); // цепочка живёт дальше даже после ошибки
+  return result;
 }
 
 // Сжимает ТОЛЬКО если файл реально больше лимита Telegram. Маленькие видео эта функция не трогает вообще.
@@ -325,13 +336,13 @@ async function ensureUnderTelegramLimit(inputPath, chatId, statusMsgId) {
   }
 
   const outPath = inputPath.replace(/\.mp4$/, '') + '_fit.mp4';
-  await compressToFit(inputPath, outPath, MAX_TELEGRAM_BYTES);
+  await runCompressionExclusive(() => compressToFit(inputPath, outPath, MAX_TELEGRAM_BYTES));
 
   if (fs.statSync(outPath).size > MAX_TELEGRAM_BYTES) {
     // Расчёт битрейта — оценка (VBR пики, реальный muxing overhead), иногда чуть промахивается.
     // Один дожим с меньшим запасом — и всё, дальше не гоняем по кругу до бесконечности.
     const outPath2 = inputPath.replace(/\.mp4$/, '') + '_fit2.mp4';
-    await compressToFit(outPath, outPath2, Math.floor(MAX_TELEGRAM_BYTES * 0.88));
+    await runCompressionExclusive(() => compressToFit(outPath, outPath2, Math.floor(MAX_TELEGRAM_BYTES * 0.88)));
     fs.unlinkSync(outPath);
     if (statusMsgId) bot.editMessageText('✅ Сжато, отправляю...', { chat_id: chatId, message_id: statusMsgId }).catch(() => {});
     return outPath2;
