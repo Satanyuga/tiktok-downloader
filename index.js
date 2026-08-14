@@ -269,15 +269,27 @@ async function downloadAndValidate(mediaUrl, version, destPath) {
 // это нужно и для обычных команд, и для "пробы" длительности видео (см. ниже).
 // onProgress(seconds, speed) вызывается на КАЖДОЙ строке прогресса, которую печатает сам ffmpeg —
 // цифры настоящие, не выдуманная оценка.
-// timeoutMs — жёсткий потолок: если процесс не уложился, убиваем его сами (SIGKILL), чтобы
-// зависшее сжатие не тянуло за собой весь сервис (как было — весь процесс ушёл в перезапуск).
-function runFfmpeg(args, onProgress, timeoutMs) {
+// opts.stallMs — убиваем процесс, если прогресс НЕ СДВИГАЕТСЯ дольше stallMs (реальное зависание).
+// opts.absoluteMs — абсолютный потолок на случай, если прогресс идёт вечно микро-шагами.
+// Важно: медленное, но ИДУЩЕЕ сжатие (например, декодирование тяжёлого 4K-исходника) — это НЕ зависание,
+// раньше фиксированный таймаут убивал такие видео на середине просто потому что они долгие, а не зависшие.
+function runFfmpeg(args, onProgress, opts = {}) {
+  const { stallMs, absoluteMs } = opts;
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, args);
     let stderr = '';
     let buf = '';
-    let timedOut = false;
-    const timer = timeoutMs ? setTimeout(() => { timedOut = true; proc.kill('SIGKILL'); }, timeoutMs) : null;
+    let timeoutReason = null;
+
+    let stallTimer = null;
+    const armStallTimer = () => {
+      if (!stallMs) return;
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => { timeoutReason = 'stall'; proc.kill('SIGKILL'); }, stallMs);
+    };
+    armStallTimer(); // отсчёт идёт и до первого прогресс-тика — если ffmpeg вообще не стартовал
+
+    const absTimer = absoluteMs ? setTimeout(() => { timeoutReason = 'absolute'; proc.kill('SIGKILL'); }, absoluteMs) : null;
 
     proc.stderr.on('data', d => {
       const s = d.toString();
@@ -288,13 +300,21 @@ function runFfmpeg(args, onProgress, timeoutMs) {
       buf = lines.pop(); // последняя (возможно неполная) строка остаётся в буфере
       for (const line of lines) {
         const m = line.match(/time=(\d+):(\d+):(\d+\.\d+).*speed=\s*([\d.]+)x/);
-        if (m) onProgress((+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]), parseFloat(m[4]));
+        if (m) {
+          armStallTimer(); // есть реальный прогресс — сдвигаем таймер зависания
+          onProgress((+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]), parseFloat(m[4]));
+        }
       }
     });
-    proc.on('error', err => { if (timer) clearTimeout(timer); reject(err); });
+    proc.on('error', err => {
+      if (stallTimer) clearTimeout(stallTimer);
+      if (absTimer) clearTimeout(absTimer);
+      reject(err);
+    });
     proc.on('close', code => {
-      if (timer) clearTimeout(timer);
-      resolve({ code: timedOut ? 'timeout' : code, stderr });
+      if (stallTimer) clearTimeout(stallTimer);
+      if (absTimer) clearTimeout(absTimer);
+      resolve({ code: timeoutReason ? `timeout:${timeoutReason}` : code, stderr });
     });
   });
 }
@@ -326,10 +346,12 @@ function formatEta(sec) {
   return `~${Math.floor(sec / 60)} мин ${Math.round(sec % 60)} сек`;
 }
 
-// Жёсткий потолок на одно сжатие. На слабом CPU (видели 0.125x — в ~8 раз медленнее реального
-// времени) лучше честно упасть и дать ретраю попробовать снова, чем зависнуть на 10+ минут
-// и утащить за собой весь процесс.
-const COMPRESS_TIMEOUT_MS = 4 * 60 * 1000;
+// Детектор зависания вместо жёсткого потолка: убиваем ffmpeg только если прогресс НЕ ИДЁТ
+// дольше STALL_MS (реальное зависание/фриз). Медленный, но ИДУЩИЙ прогресс (например, декодирование
+// тяжёлого 4K-исходника — видели 2160x3840 в логах) — это не зависание, ему просто нужно больше времени.
+// ABSOLUTE_MS — крайний потолок на случай микро-прогресса без реального завершения (перестраховка).
+const COMPRESS_STALL_MS = 90 * 1000;
+const COMPRESS_ABSOLUTE_MS = 20 * 60 * 1000;
 
 // Сжимает ПОД ТОЧНЫЙ РАЗМЕР — считаем битрейт из длительности видео и целевого размера,
 // вместо того чтобы вслепую понижать разрешение. Разрешение почти всегда остаётся оригинальным
@@ -362,9 +384,9 @@ async function compressToFit(input, output, targetBytes, duration, progressCtx) 
   };
 
   const t0 = Date.now();
-  // Сервер оказался в разы медленнее обычного (0.125x реального времени в логах — почти в 8 раз
-  // медленнее нормального ядра). Урезаю разрешение и ставлю самый быстрый preset — иначе даже
-  // короткие видео будут сжиматься по 5-10 минут и утаскивать инстанс в OOM.
+  // Сервер оказался в разы медленнее обычного (0.12x реального времени в логах — почти в 8 раз
+  // медленнее нормального ядра). Урезаю разрешение и ставлю самый быстрый preset — но это не помогает
+  // против тяжёлого ДЕКОДИРОВАНИЯ 4K-исходника (оно не зависит от целевого разрешения на выходе).
   const { code, stderr } = await runFfmpeg([
     '-y', '-i', input,
     '-vf', "scale='min(640,iw)':'min(640,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
@@ -373,9 +395,10 @@ async function compressToFit(input, output, targetBytes, duration, progressCtx) 
     '-c:a', 'aac', '-b:a', `${audioKbps}k`,
     '-movflags', '+faststart',
     output
-  ], onProgress, COMPRESS_TIMEOUT_MS);
+  ], onProgress, { stallMs: COMPRESS_STALL_MS, absoluteMs: COMPRESS_ABSOLUTE_MS });
 
-  if (code === 'timeout') throw new Error(`compress timeout: не уложились в ${COMPRESS_TIMEOUT_MS / 1000}с, процесс убит принудительно`);
+  if (code === 'timeout:stall') throw new Error(`compress: завис (нет прогресса ${COMPRESS_STALL_MS / 1000}с), процесс убит принудительно`);
+  if (code === 'timeout:absolute') throw new Error(`compress: превышен абсолютный потолок ${COMPRESS_ABSOLUTE_MS / 60000} мин, процесс убит принудительно`);
   if (code !== 0) throw new Error(`compress exit ${code}: ${stderr.slice(-300)}`);
   console.log(`✅ [${progressCtx.url}] сжатие (${progressCtx.label}) готово за ${((Date.now() - t0) / 1000).toFixed(1)}с: ${(fs.statSync(output).size / 1024 / 1024).toFixed(1)}MB`);
 }
@@ -474,11 +497,11 @@ async function downloadWithRetry(chatId, url, statusMsgId) {
     } catch (err) {
       console.error(`❌ Ошибка загрузки [круг ${round}/${RETRY_ROUNDS}] ${url} — ${err.message || err}`);
       if (round === RETRY_ROUNDS) {
-        const failText = '⚠️ Не получилось скачать это видео. Попробуй ещё раз чуть позже.';
+        const failText = `⚠️ ${url}\nНе получилось скачать это видео. Попробуй ещё раз чуть позже.`;
         if (statusMsgId) {
-          bot.editMessageText(failText, { chat_id: chatId, message_id: statusMsgId }).catch(() => bot.sendMessage(chatId, failText));
+          bot.editMessageText(failText, { chat_id: chatId, message_id: statusMsgId, disable_web_page_preview: true }).catch(() => bot.sendMessage(chatId, failText, { disable_web_page_preview: true }));
         } else {
-          bot.sendMessage(chatId, failText);
+          bot.sendMessage(chatId, failText, { disable_web_page_preview: true });
         }
       }
     }
