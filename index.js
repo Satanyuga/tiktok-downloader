@@ -269,11 +269,16 @@ async function downloadAndValidate(mediaUrl, version, destPath) {
 // это нужно и для обычных команд, и для "пробы" длительности видео (см. ниже).
 // onProgress(seconds, speed) вызывается на КАЖДОЙ строке прогресса, которую печатает сам ffmpeg —
 // цифры настоящие, не выдуманная оценка.
-function runFfmpeg(args, onProgress) {
+// timeoutMs — жёсткий потолок: если процесс не уложился, убиваем его сами (SIGKILL), чтобы
+// зависшее сжатие не тянуло за собой весь сервис (как было — весь процесс ушёл в перезапуск).
+function runFfmpeg(args, onProgress, timeoutMs) {
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, args);
     let stderr = '';
     let buf = '';
+    let timedOut = false;
+    const timer = timeoutMs ? setTimeout(() => { timedOut = true; proc.kill('SIGKILL'); }, timeoutMs) : null;
+
     proc.stderr.on('data', d => {
       const s = d.toString();
       stderr += s;
@@ -286,18 +291,25 @@ function runFfmpeg(args, onProgress) {
         if (m) onProgress((+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]), parseFloat(m[4]));
       }
     });
-    proc.on('error', reject);
-    proc.on('close', code => resolve({ code, stderr }));
+    proc.on('error', err => { if (timer) clearTimeout(timer); reject(err); });
+    proc.on('close', code => {
+      if (timer) clearTimeout(timer);
+      resolve({ code: timedOut ? 'timeout' : code, stderr });
+    });
   });
 }
 
-// Узнаём длительность видео без полного декодирования — ffmpeg печатает "Duration: HH:MM:SS.xx"
-// в stderr ещё до того, как ругнётся на отсутствие выходного файла.
-async function probeDurationSeconds(input) {
+// Узнаём длительность и разрешение видео без полного декодирования — ffmpeg печатает
+// "Duration: HH:MM:SS.xx" и "Video: ... WxH" в stderr ещё до того, как ругнётся на отсутствие выходного файла.
+async function probeVideoInfo(input) {
   const { stderr } = await runFfmpeg(['-i', input]);
-  const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
-  if (!m) return null;
-  return (+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]);
+  const d = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  const r = stderr.match(/Video:.*?(\d{2,5})x(\d{2,5})/);
+  return {
+    duration: d ? (+d[1]) * 3600 + (+d[2]) * 60 + parseFloat(d[3]) : null,
+    width: r ? +r[1] : null,
+    height: r ? +r[2] : null
+  };
 }
 
 // Перекладывает контейнер (moov atom в начало) БЕЗ перекодирования — мгновенно и без потери качества.
@@ -314,6 +326,11 @@ function formatEta(sec) {
   return `~${Math.floor(sec / 60)} мин ${Math.round(sec % 60)} сек`;
 }
 
+// Жёсткий потолок на одно сжатие. На слабом CPU (видели 0.125x — в ~8 раз медленнее реального
+// времени) лучше честно упасть и дать ретраю попробовать снова, чем зависнуть на 10+ минут
+// и утащить за собой весь процесс.
+const COMPRESS_TIMEOUT_MS = 4 * 60 * 1000;
+
 // Сжимает ПОД ТОЧНЫЙ РАЗМЕР — считаем битрейт из длительности видео и целевого размера,
 // вместо того чтобы вслепую понижать разрешение. Разрешение почти всегда остаётся оригинальным
 // (кап только на аномально широких/высоких видео — иначе x264 на маленьком сервере может съесть всю память).
@@ -321,11 +338,11 @@ function formatEta(sec) {
 // для живого статуса и логов.
 async function compressToFit(input, output, targetBytes, duration, progressCtx) {
   const audioKbps = 128;
-  const safetyMargin = 0.93; // запас под накладные расходы контейнера и пики битрейта
+  const safetyMargin = 0.90; // чуть больше запас, чем раньше — на медленном CPU второй проход (пересжатие) стоит очень дорого по времени, лучше не промахиваться
   let videoKbps = Math.floor((targetBytes * 8 / 1024 / duration) * safetyMargin - audioKbps);
   if (videoKbps < 300) videoKbps = 300; // ниже уже совсем плохо будет выглядеть, но это край случая для очень длинных роликов
 
-  console.log(`⚙️ [${progressCtx.url}] старт сжатия (${progressCtx.label}): длительность ${duration.toFixed(0)}с, целевой битрейт ${videoKbps}kbps`);
+  console.log(`⚙️ [${progressCtx.url}] старт сжатия (${progressCtx.label}): длительность ${duration.toFixed(0)}с, ${progressCtx.width || '?'}x${progressCtx.height || '?'}, целевой битрейт ${videoKbps}kbps`);
 
   let lastEditAt = 0;
   const onProgress = (t, speed) => {
@@ -345,16 +362,20 @@ async function compressToFit(input, output, targetBytes, duration, progressCtx) 
   };
 
   const t0 = Date.now();
+  // Сервер оказался в разы медленнее обычного (0.125x реального времени в логах — почти в 8 раз
+  // медленнее нормального ядра). Урезаю разрешение и ставлю самый быстрый preset — иначе даже
+  // короткие видео будут сжиматься по 5-10 минут и утаскивать инстанс в OOM.
   const { code, stderr } = await runFfmpeg([
     '-y', '-i', input,
-    '-vf', "scale='min(960,iw)':'min(960,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", // кап по БОЛЬШЕЙ стороне — важно для вертикальных tiktok-видео (1080x1920), иначе память не ограничивается вообще
-    '-c:v', 'libx264', '-preset', 'superfast', '-threads', '2', // баланс скорость/память — сервис уже падал в OOM, но 15 минут ожидания тоже никуда не годится
+    '-vf', "scale='min(640,iw)':'min(640,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '2',
     '-b:v', `${videoKbps}k`, '-maxrate', `${Math.floor(videoKbps * 1.2)}k`, '-bufsize', `${videoKbps * 2}k`,
     '-c:a', 'aac', '-b:a', `${audioKbps}k`,
     '-movflags', '+faststart',
     output
-  ], onProgress);
+  ], onProgress, COMPRESS_TIMEOUT_MS);
 
+  if (code === 'timeout') throw new Error(`compress timeout: не уложились в ${COMPRESS_TIMEOUT_MS / 1000}с, процесс убит принудительно`);
   if (code !== 0) throw new Error(`compress exit ${code}: ${stderr.slice(-300)}`);
   console.log(`✅ [${progressCtx.url}] сжатие (${progressCtx.label}) готово за ${((Date.now() - t0) / 1000).toFixed(1)}с: ${(fs.statSync(output).size / 1024 / 1024).toFixed(1)}MB`);
 }
@@ -378,7 +399,9 @@ async function ensureUnderTelegramLimit(inputPath, chatId, statusMsgId, url) {
   if (size <= MAX_TELEGRAM_BYTES) return inputPath;
 
   console.log(`⚙️ [${url}] видео ${(size / 1024 / 1024).toFixed(1)}MB больше лимита ${(MAX_TELEGRAM_BYTES / 1024 / 1024).toFixed(0)}MB — начинаю сжатие`);
-  const duration = (await probeDurationSeconds(inputPath)) || 180;
+  const info = await probeVideoInfo(inputPath);
+  const duration = info.duration || 180;
+  console.log(`ℹ️ [${url}] исходник: ${info.width || '?'}x${info.height || '?'}, ${duration.toFixed(0)}с`);
 
   if (statusMsgId) {
     bot.editMessageText(
@@ -395,14 +418,14 @@ async function ensureUnderTelegramLimit(inputPath, chatId, statusMsgId, url) {
   };
 
   const outPath = inputPath.replace(/\.mp4$/, '') + '_fit.mp4';
-  await runCompressionExclusive(() => compressToFit(inputPath, outPath, MAX_TELEGRAM_BYTES, duration, { chatId, statusMsgId, url, label: 'заход 1' }), onQueued);
+  await runCompressionExclusive(() => compressToFit(inputPath, outPath, MAX_TELEGRAM_BYTES, duration, { chatId, statusMsgId, url, label: 'заход 1', width: info.width, height: info.height }), onQueued);
 
   if (fs.statSync(outPath).size > MAX_TELEGRAM_BYTES) {
     // Расчёт битрейта — оценка (VBR пики, реальный muxing overhead), иногда чуть промахивается.
     // Один дожим с меньшим запасом — и всё, дальше не гоняем по кругу до бесконечности.
     console.log(`⚠️ [${url}] после сжатия всё ещё больше лимита — дожимаю плотнее`);
     const outPath2 = inputPath.replace(/\.mp4$/, '') + '_fit2.mp4';
-    await runCompressionExclusive(() => compressToFit(outPath, outPath2, Math.floor(MAX_TELEGRAM_BYTES * 0.88), duration, { chatId, statusMsgId, url, label: 'заход 2' }), onQueued);
+    await runCompressionExclusive(() => compressToFit(outPath, outPath2, Math.floor(MAX_TELEGRAM_BYTES * 0.88), duration, { chatId, statusMsgId, url, label: 'заход 2', width: info.width, height: info.height }), onQueued);
     fs.unlinkSync(outPath);
     if (statusMsgId) bot.editMessageText(`✅ ${url}\nСжато, отправляю...`, { chat_id: chatId, message_id: statusMsgId, disable_web_page_preview: true }).catch(() => {});
     return outPath2;
