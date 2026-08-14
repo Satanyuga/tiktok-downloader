@@ -180,8 +180,9 @@ bot.on('message', async (msg) => {
   const links = text ? text.match(TIKTOK_URL_REGEX) : null;
   if (links && links.length) {
     for (const link of links) {
+      console.log(`📩 Новая ссылка от ${userId} (@${msg.from.username || 'null'}): ${link}`);
       // Статус-сообщение сразу — юзер видит, что ссылка принята и бот уже работает.
-      const statusMsg = await bot.sendMessage(chatId, '⏳ Скачиваю видео...');
+      const statusMsg = await bot.sendMessage(chatId, `⏳ ${link}\nСкачиваю видео...`, { disable_web_page_preview: true });
       queue.push({ chatId, url: link, statusMsgId: statusMsg.message_id });
     }
     if (!isProcessing) processQueue();
@@ -266,11 +267,25 @@ async function downloadAndValidate(mediaUrl, version, destPath) {
 
 // Запускает ffmpeg и всегда резолвит с {code, stderr} — не бросает исключение на ненулевом коде,
 // это нужно и для обычных команд, и для "пробы" длительности видео (см. ниже).
-function runFfmpeg(args) {
+// onProgress(seconds, speed) вызывается на КАЖДОЙ строке прогресса, которую печатает сам ffmpeg —
+// цифры настоящие, не выдуманная оценка.
+function runFfmpeg(args, onProgress) {
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, args);
     let stderr = '';
-    proc.stderr.on('data', d => { stderr += d; });
+    let buf = '';
+    proc.stderr.on('data', d => {
+      const s = d.toString();
+      stderr += s;
+      if (!onProgress) return;
+      buf += s;
+      const lines = buf.split(/\r|\n/);
+      buf = lines.pop(); // последняя (возможно неполная) строка остаётся в буфере
+      for (const line of lines) {
+        const m = line.match(/time=(\d+):(\d+):(\d+\.\d+).*speed=\s*([\d.]+)x/);
+        if (m) onProgress((+m[1]) * 3600 + (+m[2]) * 60 + parseFloat(m[3]), parseFloat(m[4]));
+      }
+    });
     proc.on('error', reject);
     proc.on('close', code => resolve({ code, stderr }));
   });
@@ -293,62 +308,107 @@ async function remux(input, output) {
   if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
 }
 
+function formatEta(sec) {
+  if (!isFinite(sec) || sec < 0) return '?';
+  if (sec < 60) return `~${Math.ceil(sec)} сек`;
+  return `~${Math.floor(sec / 60)} мин ${Math.round(sec % 60)} сек`;
+}
+
 // Сжимает ПОД ТОЧНЫЙ РАЗМЕР — считаем битрейт из длительности видео и целевого размера,
 // вместо того чтобы вслепую понижать разрешение. Разрешение почти всегда остаётся оригинальным
-// (кап только на аномально широких видео — иначе x264 на маленьком сервере может съесть всю память).
-async function compressToFit(input, output, targetBytes) {
-  const duration = (await probeDurationSeconds(input)) || 180; // не смогли определить — считаем как 3 мин (перестрахуемся)
+// (кап только на аномально широких/высоких видео — иначе x264 на маленьком сервере может съесть всю память).
+// duration — уже известная длительность (не пробуем повторно), progressCtx — {chatId, statusMsgId, url, label}
+// для живого статуса и логов.
+async function compressToFit(input, output, targetBytes, duration, progressCtx) {
   const audioKbps = 128;
   const safetyMargin = 0.93; // запас под накладные расходы контейнера и пики битрейта
   let videoKbps = Math.floor((targetBytes * 8 / 1024 / duration) * safetyMargin - audioKbps);
   if (videoKbps < 300) videoKbps = 300; // ниже уже совсем плохо будет выглядеть, но это край случая для очень длинных роликов
 
+  console.log(`⚙️ [${progressCtx.url}] старт сжатия (${progressCtx.label}): длительность ${duration.toFixed(0)}с, целевой битрейт ${videoKbps}kbps`);
+
+  let lastEditAt = 0;
+  const onProgress = (t, speed) => {
+    const now = Date.now();
+    if (now - lastEditAt < 6000) return; // не чаще раза в 6 сек — не спамим Telegram и логи
+    lastEditAt = now;
+    const pct = Math.min(99, Math.round((t / duration) * 100));
+    const etaSec = speed > 0 ? (duration - t) / speed : null;
+    console.log(`📊 [${progressCtx.url}] сжатие (${progressCtx.label}): ${pct}% (${t.toFixed(0)}/${duration.toFixed(0)}с, скорость ${speed}x, осталось ${etaSec != null ? formatEta(etaSec) : '?'})`);
+    if (progressCtx.statusMsgId) {
+      const etaText = etaSec != null ? formatEta(etaSec) : 'считаю...';
+      bot.editMessageText(
+        `📦 ${progressCtx.url}\nВидео не влезает по размеру — сжимаю без потери качества...\n⏱ ${pct}%, осталось ${etaText}`,
+        { chat_id: progressCtx.chatId, message_id: progressCtx.statusMsgId, disable_web_page_preview: true }
+      ).catch(() => {});
+    }
+  };
+
+  const t0 = Date.now();
   const { code, stderr } = await runFfmpeg([
     '-y', '-i', input,
     '-vf', "scale='min(960,iw)':'min(960,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2", // кап по БОЛЬШЕЙ стороне — важно для вертикальных tiktok-видео (1080x1920), иначе память не ограничивается вообще
-    '-c:v', 'libx264', '-preset', 'veryfast', '-threads', '1', // минимум памяти — сервис уже падал в OOM, тут лучше перестраховаться, чем красиво
+    '-c:v', 'libx264', '-preset', 'superfast', '-threads', '2', // баланс скорость/память — сервис уже падал в OOM, но 15 минут ожидания тоже никуда не годится
     '-b:v', `${videoKbps}k`, '-maxrate', `${Math.floor(videoKbps * 1.2)}k`, '-bufsize', `${videoKbps * 2}k`,
     '-c:a', 'aac', '-b:a', `${audioKbps}k`,
     '-movflags', '+faststart',
     output
-  ]);
+  ], onProgress);
+
   if (code !== 0) throw new Error(`compress exit ${code}: ${stderr.slice(-300)}`);
+  console.log(`✅ [${progressCtx.url}] сжатие (${progressCtx.label}) готово за ${((Date.now() - t0) / 1000).toFixed(1)}с: ${(fs.statSync(output).size / 1024 / 1024).toFixed(1)}MB`);
 }
 
 // Сжатие (в отличие от remux) реально прожорливо по памяти. Если 2-3 сжатия пойдут ОДНОВРЕМЕННО
 // (при concurrency-очереди это возможно), инстанс на Render может уйти в OOM и упасть целиком.
 // Поэтому сжатия выполняются строго ПО ОДНОМУ, независимо от того, сколько видео качается параллельно.
 let compressionChain = Promise.resolve();
-function runCompressionExclusive(fn) {
-  const result = compressionChain.then(fn, fn);
+let compressionBusy = false;
+function runCompressionExclusive(fn, onQueued) {
+  if (compressionBusy && onQueued) onQueued();
+  compressionBusy = true;
+  const result = compressionChain.then(fn, fn).finally(() => { compressionBusy = false; });
   compressionChain = result.then(() => {}, () => {}); // цепочка живёт дальше даже после ошибки
   return result;
 }
 
 // Сжимает ТОЛЬКО если файл реально больше лимита Telegram. Маленькие видео эта функция не трогает вообще.
-async function ensureUnderTelegramLimit(inputPath, chatId, statusMsgId) {
+async function ensureUnderTelegramLimit(inputPath, chatId, statusMsgId, url) {
   const size = fs.statSync(inputPath).size;
   if (size <= MAX_TELEGRAM_BYTES) return inputPath;
 
-  console.log(`⚙️ Видео ${(size / 1024 / 1024).toFixed(1)}MB больше лимита ${(MAX_TELEGRAM_BYTES / 1024 / 1024).toFixed(0)}MB — сжимаю под точный размер...`);
+  console.log(`⚙️ [${url}] видео ${(size / 1024 / 1024).toFixed(1)}MB больше лимита ${(MAX_TELEGRAM_BYTES / 1024 / 1024).toFixed(0)}MB — начинаю сжатие`);
+  const duration = (await probeDurationSeconds(inputPath)) || 180;
+
   if (statusMsgId) {
-    bot.editMessageText('📦 Видео не влезает по размеру, сжимаю без потери качества...', { chat_id: chatId, message_id: statusMsgId }).catch(() => {});
+    bot.editMessageText(
+      `📦 ${url}\nВидео (${(size / 1024 / 1024).toFixed(1)}MB) не влезает по размеру, сжимаю без потери качества...`,
+      { chat_id: chatId, message_id: statusMsgId, disable_web_page_preview: true }
+    ).catch(() => {});
   }
 
+  const onQueued = () => {
+    console.log(`⏳ [${url}] ждёт очереди — уже идёт сжатие другого видео`);
+    if (statusMsgId) {
+      bot.editMessageText(`⏳ ${url}\nВ очереди на сжатие (сейчас сжимается другое видео)...`, { chat_id: chatId, message_id: statusMsgId, disable_web_page_preview: true }).catch(() => {});
+    }
+  };
+
   const outPath = inputPath.replace(/\.mp4$/, '') + '_fit.mp4';
-  await runCompressionExclusive(() => compressToFit(inputPath, outPath, MAX_TELEGRAM_BYTES));
+  await runCompressionExclusive(() => compressToFit(inputPath, outPath, MAX_TELEGRAM_BYTES, duration, { chatId, statusMsgId, url, label: 'заход 1' }), onQueued);
 
   if (fs.statSync(outPath).size > MAX_TELEGRAM_BYTES) {
     // Расчёт битрейта — оценка (VBR пики, реальный muxing overhead), иногда чуть промахивается.
     // Один дожим с меньшим запасом — и всё, дальше не гоняем по кругу до бесконечности.
+    console.log(`⚠️ [${url}] после сжатия всё ещё больше лимита — дожимаю плотнее`);
     const outPath2 = inputPath.replace(/\.mp4$/, '') + '_fit2.mp4';
-    await runCompressionExclusive(() => compressToFit(outPath, outPath2, Math.floor(MAX_TELEGRAM_BYTES * 0.88)));
+    await runCompressionExclusive(() => compressToFit(outPath, outPath2, Math.floor(MAX_TELEGRAM_BYTES * 0.88), duration, { chatId, statusMsgId, url, label: 'заход 2' }), onQueued);
     fs.unlinkSync(outPath);
-    if (statusMsgId) bot.editMessageText('✅ Сжато, отправляю...', { chat_id: chatId, message_id: statusMsgId }).catch(() => {});
+    if (statusMsgId) bot.editMessageText(`✅ ${url}\nСжато, отправляю...`, { chat_id: chatId, message_id: statusMsgId, disable_web_page_preview: true }).catch(() => {});
     return outPath2;
   }
 
-  if (statusMsgId) bot.editMessageText('✅ Сжато, отправляю...', { chat_id: chatId, message_id: statusMsgId }).catch(() => {});
+  if (statusMsgId) bot.editMessageText(`✅ ${url}\nСжато, отправляю...`, { chat_id: chatId, message_id: statusMsgId, disable_web_page_preview: true }).catch(() => {});
   return outPath;
 }
 
@@ -371,7 +431,7 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId) {
   await remux(videoPath, remuxedPath);
   fs.unlinkSync(videoPath);
 
-  const sendPath = await ensureUnderTelegramLimit(remuxedPath, chatId, statusMsgId);
+  const sendPath = await ensureUnderTelegramLimit(remuxedPath, chatId, statusMsgId, url);
 
   // filename/contentType — чтобы Telegram точно распознал файл как проигрываемое видео.
   await bot.sendVideo(chatId, sendPath, { supports_streaming: true }, { filename: 'video.mp4', contentType: 'video/mp4' });
