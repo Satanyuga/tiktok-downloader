@@ -248,24 +248,58 @@ async function fetchMediaAnyProvider(url) {
 // Скачивает файл по ссылке и проверяет, что это ДЕЙСТВИТЕЛЬНО видео, а не HTML-заглушка
 // (некоторые CDN без правильного Referer отдают страницу "доступ запрещён" вместо mp4 —
 // именно из-за этого часть видео раньше приходила "битым документом" без превью).
+// Раньше здесь не было защиты от зависания: если CDN "капает" данными очень медленно
+// (или подвисает без явной ошибки), axios timeout не гарантированно срабатывает на потоковом
+// ответе — видели зависание именно тут. Добавлен детектор простоя + абсолютный потолок,
+// оба обрывают скачивание через AbortController.
+const DOWNLOAD_STALL_MS = 20 * 1000; // нет новых данных 20с — считаем зависшим
+const DOWNLOAD_ABSOLUTE_MS = 3 * 60 * 1000; // на случай вечного микро-капанья
+
 async function downloadAndValidate(mediaUrl, version, destPath) {
-  const vRes = await axios.get(mediaUrl, {
-    responseType: 'stream',
-    timeout: 30000,
-    headers: { 'User-Agent': UA, 'Referer': REFERERS[version] || '' }
-  });
+  const controller = new AbortController();
+  let stallTimer = null;
+  const armStall = () => {
+    if (stallTimer) clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => controller.abort(), DOWNLOAD_STALL_MS);
+  };
+  armStall();
+  const absTimer = setTimeout(() => controller.abort(), DOWNLOAD_ABSOLUTE_MS);
+  const clearTimers = () => { if (stallTimer) clearTimeout(stallTimer); clearTimeout(absTimer); };
+
+  let vRes;
+  try {
+    vRes = await axios.get(mediaUrl, {
+      responseType: 'stream',
+      timeout: 20000,
+      signal: controller.signal,
+      headers: { 'User-Agent': UA, 'Referer': REFERERS[version] || '' }
+    });
+  } catch (err) {
+    clearTimers();
+    if (controller.signal.aborted) throw new Error(`${version}: не удалось даже начать скачивание (таймаут)`);
+    throw err;
+  }
 
   const contentType = vRes.headers['content-type'] || '';
   if (contentType && !contentType.startsWith('video') && !contentType.includes('octet-stream')) {
+    clearTimers();
     throw new Error(`${version}: сервер отдал не видео (content-type: ${contentType})`);
   }
 
   const writer = fs.createWriteStream(destPath);
+  vRes.data.on('data', armStall); // любые новые байты — сдвигаем таймер простоя
   vRes.data.pipe(writer);
-  await new Promise((resolve, reject) => {
-    writer.on('finish', resolve);
-    writer.on('error', reject);
-  });
+
+  try {
+    await new Promise((resolve, reject) => {
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+      vRes.data.on('error', reject);
+      controller.signal.addEventListener('abort', () => reject(new Error(`${version}: скачивание зависло/не уложилось в лимит времени`)));
+    });
+  } finally {
+    clearTimers();
+  }
 
   const size = fs.existsSync(destPath) ? fs.statSync(destPath).size : 0;
   if (size < 20000) { // меньше ~20KB — почти наверняка не настоящее видео, а заглушка/ошибка
