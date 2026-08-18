@@ -203,8 +203,8 @@ function extractMedia(version, result) {
     videoUrl = result.video?.playAddr?.[0] || result.video?.downloadAddr?.[0];
   } else if (version === 'v2') { // ssstik — сервис-зеркало, обычно уже ужатая для шаринга версия
     videoUrl = result.video?.playAddr || result.direct;
-  } else if (version === 'v3') { // musicaldown — аналогично, компактнее мастер-файла
-    videoUrl = result.videoHD || result.videoWatermark;
+  } else if (version === 'v3') { // musicaldown — у него только 2 варианта: HD (тяжёлый) или watermark (компактный)
+    videoUrl = result.videoWatermark || result.videoHD; // берём компактный первым — размер важнее вотемарки
   }
 
   if (videoUrl) return { video: videoUrl };
