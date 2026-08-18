@@ -246,10 +246,9 @@ bot.on('callback_query', async (query) => {
   saveUserQuality();
 
   bot.answerCallbackQuery(query.id, { text: `Качество: ${QUALITY_LABELS[quality]}` }).catch(() => {});
-  bot.editMessageText(
-    `⚙️ Качество обновлено: ${QUALITY_LABELS[quality]}\nПрименится ко всем следующим видео (независимо от настроек других пользователей).`,
-    { chat_id: chatId, message_id: query.message.message_id, reply_markup: qualityInlineKeyboard(quality) }
-  ).catch(() => {});
+  // Убираем громоздкое меню с кнопками и оставляем один короткий текст — не засоряем чат.
+  bot.deleteMessage(chatId, query.message.message_id).catch(() => {});
+  bot.sendMessage(chatId, `⚙️ Качество обновлено: ${QUALITY_LABELS[quality]}`).catch(() => {});
 });
 
 // 🔄 ГЛАВНЫЙ ОБРАБОТЧИК
@@ -301,11 +300,11 @@ bot.on('message', async (msg) => {
   if (text === '⚙️ Качество' || text === '/quality') {
     const current = getUserQuality(userId);
     return bot.sendMessage(chatId,
-      `⚙️ Выбери качество, в котором буду скачивать видео.\nТекущий выбор: ${QUALITY_LABELS[current]}\n\n` +
+      `⚙️ Выбор качества скачивания видео.\nТекущий выбор: ${QUALITY_LABELS[current]}\n\n` +
       `🔉 Слабое — всегда максимально компактно\n` +
       `🎬 Хорошее — баланс качества и размера\n` +
       `💎 Максимальное — лучшее доступное качество (без принудительного пережатия)\n` +
-      `🤖 Автоматическое — сначала пробую максимум, если не влезает по размеру (лимит Telegram — 50MB) — снижаю качество шаг за шагом`,
+      `🤖 Автоматическое — сначала пробуется максимум, если не влезает по размеру (лимит — 50MB) — снижается качество шаг за шагом`,
       { reply_markup: qualityInlineKeyboard(current) }
     );
   }
