@@ -1,65 +1,95 @@
-# TikTok Video Downloader Telegram Bot
+# TikTok Downloader — Telegram Bot
 
-## Description
-This bot allows users to download TikTok videos without a watermark directly from Telegram. The bot uses the [unoffical TikTok API by TikWM](https://www.tikwm.com) to fetch the video and then sends it back to the user.
+> Этот README написан как контекст-праймер для AI-ассистента (Claude, ChatGPT и т.д.),
+> чтобы он мог быстро понять архитектуру проекта и продолжить работу над кодом без
+> дополнительных пояснений. Секретов, токенов и персональных данных здесь нет —
+> все чувствительные значения задаются только через переменные окружения.
 
-## Features
-- Downloads TikTok videos without watermarks directly from Telegram.
-- Provides clear instructions with `/start` command.
-- Handles TikTok video links and sends the video back to the user.
-- Offers feedback messages during the download process.
-- Notifies users if a video cannot be downloaded.
+## Что делает бот
 
-## Installation
+Telegram-бот: пользователь присылает ссылку на TikTok-видео (или несколько ссылок сразу),
+бот скачивает видео без вотемарки и присылает его обратно файлом. Работает через несколько
+независимых провайдеров-зеркал с фолбэком, чинит контейнер видео под Telegram, при
+необходимости сжимает под лимит 50MB, и умеет подстраивать качество под выбор конкретного
+пользователя.
 
-### Prerequisites
-- Node.js installed on your machine
-- A Telegram bot token from [BotFather](https://core.telegram.org/bots#6-botfather)
+## Стек
 
-### Steps
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/edizbaha/tiktok-downloader.git
-   cd tiktok-downloader
-   ```
-2. Install the required dependencies:
-   ```bash
-   npm install
-   ```
-3. Replace `'YOUR_TELEGRAM_BOT_TOKEN'` with your actual Telegram bot token in the `index.js` file:
-   ```javascript
-   var token = 'YOUR_TELEGRAM_BOT_TOKEN';
-   ```
-4. Run the bot:
-   ```bash
-   node index.js
-   ```
+- Node.js (>=16), `express` — держит порт открытым для Render (health-check `/`, `/ping`)
+- `node-telegram-bot-api` — long polling, без вебхуков
+- `@tobyg74/tiktok-api-dl` — три версии провайдера получения ссылки на медиа (v1/v2/v3)
+- `ffmpeg-static` + `child_process.spawn` — ремукс/перекодирование/сжатие видео
+- `axios` — скачивание видео по прямой ссылке, HTTP к GitHub API
 
-## Usage
-1. Start a chat with your bot on Telegram.
-2. Use the `/start` command to receive a welcome message and instructions.
-3. Send a valid TikTok video link.
-4. Wait for the bot to download and send the video back to you.
+## Переменные окружения (обязательные)
 
-## Example
-1. User: `/start`
-   - Bot: "👋 Hi, I am a bot for downloading TikTok videos without watermark."
-   - Bot: "✨ Please send the video link"
-2. User: `https://www.tiktok.com/@username/video/1234567890`
-   - Bot: "⏳ Please wait..."
-   - Bot: (sends the video)
+| Переменная | Назначение |
+|---|---|
+| `TELEGRAM_TOKEN` | токен Telegram-бота от BotFather |
+| `GITHUB_TOKEN` | токен с правом записи в репозиторий (используется как хранилище белого/чёрного списка) |
+| `PORT` | порт для express, опционально — иначе 3000 |
 
-## Contributing
-Feel free to fork this project, submit issues and pull requests. Contributions are welcome! 💖
+Владелец репозитория/имя репозитория, куда пишутся списки пользователей, заданы в коде
+константами `REPO_OWNER` / `REPO_NAME` в `index.js` — поменять под свой форк перед деплоем.
 
-## License
-This project is licensed under the MIT License.
+## Архитектура файла `index.js` (всё в одном файле)
 
-## Contact
-For any questions or feedback, please contact:
-- GitHub: [edizbaha](https://github.com/edizbaha)
-- Email: [ediz@omg.lol](mailto:ediz@omg.lol)
+1. **HTTP-заглушка (express)** — чтобы Render не убивал процесс как "неактивный веб-сервис".
+2. **Белый/чёрный список пользователей** — хранятся как текстовые файлы в GitHub-репозитории
+   (`all_users.txt`, `blacklist.txt`), читаются/пишутся через GitHub Contents API,
+   синхронизируются раз в 5 минут (`syncGitHubLists`). Бан проверяется на каждое сообщение
+   раньше вообще любой другой логики.
+3. **Авторизация "я не бот"** — новый пользователь жмёт кнопку `🔐 Я человек`, после чего
+   попадает в `all_users.txt` и получает доступ.
+4. **🎚 Выбор качества (персонально для каждого пользователя)** — кнопка `⚙️ Качество`
+   (или команда `/quality`) показывает inline-клавиатуру с 4 вариантами:
+   `weak` / `good` / `max` / `auto`. Выбор хранится в `USER_QUALITY` (Map в памяти),
+   персистится в локальный `user_quality.json` рядом с процессом (переживает рестарт,
+   но не переживает редеплой с чистым диском — при желании можно перенести хранение
+   в GitHub по аналогии с белым/чёрным списком).
+   - `max` — ничего не трогаем, пока видео и так укладывается в лимит; сжимаем только если
+     оно больше 50MB.
+   - `weak` / `good` — видео **всегда** принудительно перекодируется под фиксированный
+     CRF-пресет (`QUALITY_TIERS`), даже если оригинал и так был бы меньше лимита; если
+     после этого всё ещё не влезло — доп. точное сжатие под байты.
+   - `auto` — пробуем по убыванию: оригинал → good → weak, останавливаемся на первом,
+     что влезло в 50MB; если даже weak не влез — точное сжатие под байты.
+5. **Очередь скачивания с конкурентностью** — ссылки складываются в `queue`,
+   `CONCURRENCY` воркеров разбирают её параллельно. Каждый воркер сам делает
+   `RETRY_ROUNDS` полных кругов по всем провайдерам при неудаче (с паузой между кругами).
+6. **Получение медиа-ссылки** (`fetchMediaAnyProvider`) — сначала параллельно спрашиваем
+   компактные зеркала (v2 ssstik, v3 musicaldown), и только если ОБА отказали — идём
+   в v1 (прямой API TikTok, отдаёт тяжёлый оригинал).
+7. **Скачивание с защитой от зависаний** (`downloadAndValidate`) — детектор простоя
+   + абсолютный таймаут через `AbortController`, проверка что реально пришло видео,
+   а не HTML-заглушка/бан по IP.
+8. **Обработка видео (ffmpeg)**:
+   - `remux` — быстрая перекладка контейнера (moov atom вперёд), без потери качества,
+     чтобы Telegram не показывал видео как "файл, надо скачать".
+   - `transcodeToPreset` — принудительное перекодирование под пресет качества (CRF).
+   - `compressToFit` — точное сжатие под целевой размер в байтах (расчёт битрейта из
+     длительности), запускается ТОЛЬКО если файл больше лимита Telegram.
+   - Все ffmpeg-операции, требующие реального перекодирования, идут строго **по одной**
+     через `runCompressionExclusive` — параллельные тяжёлые кодирования могут уронить
+     инстанс по памяти на маленьком сервере (Render free-тир).
+9. **Отправка** — `bot.sendVideo` с явными `duration`/`width`/`height`, чтобы Telegram
+   сразу показывал плеер, а не карточку файла.
 
-## Acknowledgements
-- [node-telegram-bot-api](https://github.com/yagop/node-telegram-bot-api) - Telegram Bot API for Node.js
-- [request](https://github.com/request/request) - Simplified HTTP request client
+## Известные особенности / ограничения
+
+- Провайдеры v2/v3 — сторонние сервисы-зеркала, иногда недоступны или банят IP хостинга
+  (Render/AWS) — это внешняя проблема, не баг кода; фолбэк на v1 частично компенсирует.
+- Хранение настроек качества — локальный файл, не переживает редеплой с эфемерным диском.
+- ffmpeg на слабом сервере может быть в разы медленнее нормального ядра — отсюда
+  `preset ultrafast` везде и детекторы "зависания vs просто долго идёт" в `runFfmpeg`.
+
+## Локальный запуск
+
+```bash
+npm install
+TELEGRAM_TOKEN=xxx GITHUB_TOKEN=xxx node index.js
+```
+
+## Лицензия
+
+MIT.
