@@ -119,14 +119,13 @@ const queue = [];
 let isProcessing = false;
 
 // tikwm.com банит IP хостингов (Render/AWS/итд) — обычный ретрай туда же бессмысленен.
-// Поэтому опрашиваем НЕЗАВИСИМЫЕ провайдеры ПАРАЛЛЕЛЬНО: v1=tikwm, v2=ssstik, v3=musicaldown.
-// Если один забанен/лежит — используем того, кто ответит первым успехом.
-const VERSIONS = ['v1', 'v2', 'v3'];
+// Поэтому опрашиваем НЕЗАВИСИМЫЕ провайдеры ПАРАЛЛЕЛЬНО: v1=прямой API TikTok, v2=ssstik, v3=musicaldown.
+// (см. MIRROR_VERSIONS/FALLBACK_VERSION ниже — v1 больше не в общей гонке, см. пояснение там)
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 // У каждого провайдера свой CDN — некоторые отдают видео только с "правильным" Referer,
 // а без него подсовывают HTML-заглушку вместо настоящего mp4 (отсюда "битые" видео-документы).
 const REFERERS = {
-  v1: 'https://www.tikwm.com/',
+  v1: 'https://www.tiktok.com/', // v1 бьёт напрямую в TikTok (не tikwm) — CDN этому и должен соответствовать
   v2: 'https://ssstik.io/',
   v3: 'https://musicaldown.com/'
 };
@@ -200,11 +199,11 @@ function extractMedia(version, result) {
   }
 
   let videoUrl = null;
-  if (version === 'v1') { // tikwm
+  if (version === 'v1') { // прямой API TikTok — оригинальный мастер-файл (может быть честным 4K)
     videoUrl = result.video?.playAddr?.[0] || result.video?.downloadAddr?.[0];
-  } else if (version === 'v2') { // ssstik
+  } else if (version === 'v2') { // ssstik — сервис-зеркало, обычно уже ужатая для шаринга версия
     videoUrl = result.video?.playAddr || result.direct;
-  } else if (version === 'v3') { // musicaldown
+  } else if (version === 'v3') { // musicaldown — аналогично, компактнее мастер-файла
     videoUrl = result.videoHD || result.videoWatermark;
   }
 
@@ -224,15 +223,25 @@ async function fetchMedia(url, version) {
   return { version, media };
 }
 
-// Опрашивает ВСЕ провайдеры ПАРАЛЛЕЛЬНО — используем того, кто первым ответил успехом.
-// Это сильно быстрее последовательного перебора: не ждём таймаут/бан одного, чтобы пойти к следующему.
+// v2/v3 — сервисы-зеркала, отдают уже ужатую для шаринга версию (то самое маленькое "как раньше").
+// v1 — прямой API TikTok, отдаёт оригинальный мастер-файл (может быть честным 4K, огромным).
+// Поэтому v1 НЕ участвует в общей гонке — он бы почти всегда выигрывал по скорости (не нужен HTML-скрейпинг)
+// и заваливал бы нас тяжёлыми файлами. Сначала параллельно пробуем компактные v2/v3, и только если
+// ОБА отказали — идём в v1 как последний резерв (лучше тяжёлое видео, чем никакого).
+const MIRROR_VERSIONS = ['v2', 'v3'];
+const FALLBACK_VERSION = 'v1';
+
 async function fetchMediaAnyProvider(url) {
-  const attempts = VERSIONS.map(v => fetchMedia(url, v));
   try {
-    return await Promise.any(attempts);
+    return await Promise.any(MIRROR_VERSIONS.map(v => fetchMedia(url, v)));
   } catch (aggErr) {
-    const details = (aggErr.errors || [aggErr]).map(e => e.message).join(' | ');
-    throw new Error(`все провайдеры отказали: ${details}`);
+    console.log(`ℹ️ [${url}] компактные зеркала (v2/v3) не сработали — пробую ${FALLBACK_VERSION} (оригинал, может быть тяжелее)`);
+    try {
+      return await fetchMedia(url, FALLBACK_VERSION);
+    } catch (fallbackErr) {
+      const details = [...(aggErr.errors || [aggErr]), fallbackErr].map(e => e.message).join(' | ');
+      throw new Error(`все провайдеры отказали: ${details}`);
+    }
   }
 }
 
@@ -461,6 +470,7 @@ async function ensureUnderTelegramLimit(inputPath, chatId, statusMsgId, url) {
 // Один полный круг: спросить у провайдеров (параллельно) и отправить результат в Telegram.
 async function fetchAndSend(chatId, url, roundAttempt, statusMsgId) {
   const { version, media } = await fetchMediaAnyProvider(url);
+  console.log(`ℹ️ [${url}] источник: ${version}${version === 'v1' ? ' (оригинал TikTok, может быть тяжёлым)' : ' (компактное зеркало)'}`);
 
   if (media.images) {
     for (const imgUrl of media.images) await bot.sendPhoto(chatId, imgUrl);
@@ -469,6 +479,7 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId) {
 
   const videoPath = path.resolve(__dirname, `v_${Date.now()}_${roundAttempt}.mp4`);
   await downloadAndValidate(media.video, version, videoPath);
+  console.log(`ℹ️ [${url}] скачано (${version}): ${(fs.statSync(videoPath).size / 1024 / 1024).toFixed(1)}MB`);
 
   // Всегда чиним контейнер (faststart) — без этого часть видео Telegram показывает
   // как "файл, нужно скачать" вместо проигрываемого ролика. Это ремукс, не перекодирование:
@@ -479,8 +490,18 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId) {
 
   const sendPath = await ensureUnderTelegramLimit(remuxedPath, chatId, statusMsgId, url);
 
-  // filename/contentType — чтобы Telegram точно распознал файл как проигрываемое видео.
-  await bot.sendVideo(chatId, sendPath, { supports_streaming: true }, { filename: 'video.mp4', contentType: 'video/mp4' });
+  // Узнаём метаданные ИМЕННО того файла, который реально отправляем (после возможного сжатия
+  // разрешение другое) — без явных duration/width/height Telegram нередко показывает видео
+  // как "файл, нужно скачать" вместо проигрываемого ролика, даже если сам контейнер в порядке.
+  const sendInfo = await probeVideoInfo(sendPath);
+  // Имя файла как раньше (v_<timestamp>.mp4) — статичное "video.mp4" было заменой без причины.
+  const displayName = `v_${Date.now()}.mp4`;
+  await bot.sendVideo(chatId, sendPath, {
+    supports_streaming: true,
+    duration: sendInfo.duration ? Math.round(sendInfo.duration) : undefined,
+    width: sendInfo.width || undefined,
+    height: sendInfo.height || undefined
+  }, { filename: displayName, contentType: 'video/mp4' });
 
   if (fs.existsSync(remuxedPath)) fs.unlinkSync(remuxedPath);
   if (sendPath !== remuxedPath && fs.existsSync(sendPath)) fs.unlinkSync(sendPath);
