@@ -138,6 +138,94 @@ const MAX_TELEGRAM_BYTES = 49 * 1024 * 1024;
 // Ловит ссылки вида vt.tiktok.com/..., vm.tiktok.com/..., www.tiktok.com/@user/video/...
 const TIKTOK_URL_REGEX = /https?:\/\/(?:[\w-]+\.)?tiktok\.com\/\S+/gi;
 
+// ============================================================================
+// 🎚 ВЫБОР КАЧЕСТВА СКАЧИВАНИЯ (у каждого пользователя своя, независимая настройка)
+// ============================================================================
+// Пресеты "слабое"/"хорошее" — принудительное перекодирование под стабильный уровень
+// качества (CRF), НЕ под точный размер в байтах. "Максимальное" пресета не имеет —
+// это оригинал без принудительного перекодирования (лучшее, что вообще можно получить).
+// Финальная точная подгонка под лимит Telegram (если всё ещё не влезло) всегда идёт
+// ПОСЛЕ этого шага через уже существующий compressToFit/ensureUnderTelegramLimit.
+const QUALITY_TIERS = {
+  weak: { maxSide: 480, crf: 30, audioKbps: 96, label: 'слабом' },
+  good: { maxSide: 720, crf: 26, audioKbps: 128, label: 'хорошем' }
+};
+
+const QUALITY_LABELS = {
+  weak: '🔉 Слабое',
+  good: '🎬 Хорошее',
+  max: '💎 Максимальное',
+  auto: '🤖 Автоматическое'
+};
+
+// Настройки качества хранятся в JSON-файле рядом с процессом — переживают обычный
+// рестарт бота (но НЕ переживают редеплой на Render с чистым диском, если тот не подключён
+// как persistent disk). Для важной для тебя надёжности это можно позже перенести на GitHub
+// по аналогии с ALL_USERS_FILE/BLACKLIST_FILE — сейчас сделано проще, чтобы не плодить лишние
+// коммиты в репозиторий на каждое нажатие кнопки.
+const USER_QUALITY_FILE = path.resolve(__dirname, 'user_quality.json');
+let USER_QUALITY = new Map();
+
+function loadUserQuality() {
+  try {
+    const raw = fs.readFileSync(USER_QUALITY_FILE, 'utf-8');
+    USER_QUALITY = new Map(Object.entries(JSON.parse(raw)));
+    console.log(`⚙️ Настройки качества загружены: ${USER_QUALITY.size} чел.`);
+  } catch (e) {
+    USER_QUALITY = new Map(); // файла ещё нет — у всех дефолт
+  }
+}
+function saveUserQuality() {
+  try {
+    fs.writeFileSync(USER_QUALITY_FILE, JSON.stringify(Object.fromEntries(USER_QUALITY)));
+  } catch (err) {
+    console.error('❌ Не удалось сохранить настройки качества:', err.message);
+  }
+}
+// По умолчанию (пока юзер не нажал кнопку) — "Автоматическое": максимум качества,
+// но с плавным снижением, если видео не влезает по размеру.
+function getUserQuality(userId) {
+  return USER_QUALITY.get(userId) || 'auto';
+}
+loadUserQuality();
+
+function qualityInlineKeyboard(current) {
+  const mark = (key) => (current === key ? '✅ ' : '');
+  return {
+    inline_keyboard: [
+      [{ text: `${mark('weak')}🔉 Слабое`, callback_data: 'quality:weak' }],
+      [{ text: `${mark('good')}🎬 Хорошее`, callback_data: 'quality:good' }],
+      [{ text: `${mark('max')}💎 Максимальное`, callback_data: 'quality:max' }],
+      [{ text: `${mark('auto')}🤖 Автоматическое`, callback_data: 'quality:auto' }]
+    ]
+  };
+}
+
+// Обработка нажатий на инлайн-кнопки выбора качества.
+bot.on('callback_query', async (query) => {
+  const data = query.data || '';
+  if (!data.startsWith('quality:')) return;
+
+  const userId = query.from.id.toString();
+  const chatId = query.message.chat.id;
+
+  if (BANNED_IDS.has(userId)) {
+    return bot.answerCallbackQuery(query.id, { text: '🚫 Доступ заблокирован владельцем.', show_alert: true }).catch(() => {});
+  }
+
+  const quality = data.split(':')[1];
+  if (!QUALITY_LABELS[quality]) return;
+
+  USER_QUALITY.set(userId, quality);
+  saveUserQuality();
+
+  bot.answerCallbackQuery(query.id, { text: `Качество: ${QUALITY_LABELS[quality]}` }).catch(() => {});
+  bot.editMessageText(
+    `⚙️ Качество обновлено: ${QUALITY_LABELS[quality]}\nПрименится ко всем следующим видео (независимо от настроек других пользователей).`,
+    { chat_id: chatId, message_id: query.message.message_id, reply_markup: qualityInlineKeyboard(quality) }
+  ).catch(() => {});
+});
+
 // 🔄 ГЛАВНЫЙ ОБРАБОТЧИК
 bot.on('message', async (msg) => {
   if (!msg.from) return;
@@ -158,8 +246,8 @@ bot.on('message', async (msg) => {
   if (text === '🔐 Я человек') {
     const info = `ID: ${userId} | @${msg.from.username || 'null'} | Name: ${msg.from.first_name}`;
     await writeToGithub(userId, info); 
-    return bot.sendMessage(chatId, `✅ Доступ разрешен. Теперь присылай ссылки.`, {
-      reply_markup: { remove_keyboard: true }
+    return bot.sendMessage(chatId, `✅ Доступ разрешен. Теперь присылай ссылки.\n\n⚙️ Кнопкой снизу в любой момент можно выбрать качество скачивания видео (по умолчанию — Автоматическое).`, {
+      reply_markup: { keyboard: [['⚙️ Качество']], resize_keyboard: true }
     });
   }
 
@@ -174,6 +262,28 @@ bot.on('message', async (msg) => {
     });
   }
 
+  // 3.5 /start ДЛЯ УЖЕ АВТОРИЗОВАННЫХ — просто напоминание, без сброса настроек качества.
+  if (text === '/start') {
+    const current = getUserQuality(userId);
+    return bot.sendMessage(chatId,
+      `👋 Привет! Пришли ссылку на TikTok — скачаю видео без вотемарки.\n\n⚙️ Текущее качество: ${QUALITY_LABELS[current]}\nПоменять — кнопкой "⚙️ Качество" снизу.`,
+      { reply_markup: { keyboard: [['⚙️ Качество']], resize_keyboard: true } }
+    );
+  }
+
+  // 3.6 КНОПКА/КОМАНДА ВЫБОРА КАЧЕСТВА — доступна в любой момент, настройка личная для каждого юзера.
+  if (text === '⚙️ Качество' || text === '/quality') {
+    const current = getUserQuality(userId);
+    return bot.sendMessage(chatId,
+      `⚙️ Выбери качество, в котором буду скачивать видео.\nТекущий выбор: ${QUALITY_LABELS[current]}\n\n` +
+      `🔉 Слабое — всегда максимально компактно\n` +
+      `🎬 Хорошее — баланс качества и размера\n` +
+      `💎 Максимальное — лучшее доступное качество (без принудительного пережатия)\n` +
+      `🤖 Автоматическое — сначала пробую максимум, если не влезает по размеру (лимит Telegram — 50MB) — снижаю качество шаг за шагом`,
+      { reply_markup: qualityInlineKeyboard(current) }
+    );
+  }
+
   // 4. РАБОТА СО ССЫЛКАМИ — достаём ВСЕ tiktok-ссылки из сообщения (их может быть несколько,
   // например при пересылке нескольких сообщений одним блоком) и добавляем каждую отдельно.
   const links = text ? text.match(TIKTOK_URL_REGEX) : null;
@@ -182,10 +292,10 @@ bot.on('message', async (msg) => {
       console.log(`📩 Новая ссылка от ${userId} (@${msg.from.username || 'null'}): ${link}`);
       // Статус-сообщение сразу — юзер видит, что ссылка принята и бот уже работает.
       const statusMsg = await bot.sendMessage(chatId, `⏳ ${link}\nСкачиваю видео...`, { disable_web_page_preview: true });
-      queue.push({ chatId, url: link, statusMsgId: statusMsg.message_id });
+      queue.push({ chatId, url: link, statusMsgId: statusMsg.message_id, userId });
     }
     if (!isProcessing) processQueue();
-  } else if (text !== '/start') {
+  } else {
     bot.sendMessage(chatId, '⚠️ Пришли ссылку на TikTok-видео.');
   }
 });
@@ -446,6 +556,49 @@ async function compressToFit(input, output, targetBytes, duration, progressCtx) 
   console.log(`✅ [${progressCtx.url}] сжатие (${progressCtx.label}) готово за ${((Date.now() - t0) / 1000).toFixed(1)}с: ${(fs.statSync(output).size / 1024 / 1024).toFixed(1)}MB`);
 }
 
+// Перекодирует видео под ФИКСИРОВАННЫЙ пресет качества ('weak' | 'good') — CRF, а не точный
+// целевой размер в байтах (в отличие от compressToFit). Итоговый размер естественно зависит
+// от контента ролика, но визуальный уровень качества стабильный и предсказуемый.
+// Разрешение всегда original, если оно меньше maxSide — апскейла нет (force_original_aspect_ratio=decrease
+// вместе с min(maxSide, iw/ih) не увеличивает маленькое видео).
+async function transcodeToPreset(input, output, tierKey, progressCtx) {
+  const tier = QUALITY_TIERS[tierKey];
+  const info = await probeVideoInfo(input);
+  const duration = info.duration || 180;
+
+  let lastEditAt = 0;
+  const onProgress = (t, speed) => {
+    const now = Date.now();
+    if (now - lastEditAt < 6000) return;
+    lastEditAt = now;
+    const pct = Math.min(99, Math.round((t / duration) * 100));
+    const etaSec = speed > 0 ? (duration - t) / speed : null;
+    console.log(`📊 [${progressCtx.url}] приведение к ${tier.label} качеству: ${pct}%`);
+    if (progressCtx.statusMsgId) {
+      const etaText = etaSec != null ? formatEta(etaSec) : 'считаю...';
+      bot.editMessageText(
+        `🎚 ${progressCtx.url}\nПривожу к выбранному качеству (${tier.label})...\n⏱ ${pct}%, осталось ${etaText}`,
+        { chat_id: progressCtx.chatId, message_id: progressCtx.statusMsgId, disable_web_page_preview: true }
+      ).catch(() => {});
+    }
+  };
+
+  const t0 = Date.now();
+  const { code, stderr } = await runFfmpeg([
+    '-y', '-i', input,
+    '-vf', `scale='min(${tier.maxSide},iw)':'min(${tier.maxSide},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2`,
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', String(tier.crf), '-threads', '2',
+    '-c:a', 'aac', '-b:a', `${tier.audioKbps}k`,
+    '-movflags', '+faststart',
+    output
+  ], onProgress, { stallMs: COMPRESS_STALL_MS, absoluteMs: COMPRESS_ABSOLUTE_MS });
+
+  if (code === 'timeout:stall') throw new Error(`preset(${tierKey}): завис (нет прогресса ${COMPRESS_STALL_MS / 1000}с), процесс убит принудительно`);
+  if (code === 'timeout:absolute') throw new Error(`preset(${tierKey}): превышен абсолютный потолок ${COMPRESS_ABSOLUTE_MS / 60000} мин, процесс убит принудительно`);
+  if (code !== 0) throw new Error(`preset(${tierKey}) exit ${code}: ${stderr.slice(-300)}`);
+  console.log(`✅ [${progressCtx.url}] приведено к ${tier.label} за ${((Date.now() - t0) / 1000).toFixed(1)}с: ${(fs.statSync(output).size / 1024 / 1024).toFixed(1)}MB`);
+}
+
 // Сжатие (в отличие от remux) реально прожорливо по памяти. Если 2-3 сжатия пойдут ОДНОВРЕМЕННО
 // (при concurrency-очереди это возможно), инстанс на Render может уйти в OOM и упасть целиком.
 // Поэтому сжатия выполняются строго ПО ОДНОМУ, независимо от того, сколько видео качается параллельно.
@@ -501,8 +654,58 @@ async function ensureUnderTelegramLimit(inputPath, chatId, statusMsgId, url) {
   return outPath;
 }
 
+// ensureUnderTelegramLimit НЕ удаляет свой входной файл, если создаёт новый (сжатый) —
+// этой обёрткой чистим за ней, чтобы промежуточные файлы разных пресетов качества не копились на диске.
+async function fitAndCleanup(inputPath, chatId, statusMsgId, url) {
+  const result = await ensureUnderTelegramLimit(inputPath, chatId, statusMsgId, url);
+  if (result !== inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+  return result;
+}
+
+// 🎚 Готовит файл ПОД ВЫБРАННОЕ ПОЛЬЗОВАТЕЛЕМ КАЧЕСТВО, и уже после этого (если всё ещё
+// не влезло в лимит Telegram) — прогоняет через точное сжатие под байты (fitAndCleanup).
+//
+// 💎 max  — ничего не трогаем, пока размер и так укладывается; сжимаем ТОЛЬКО если превышен лимит.
+// 🎬/🔉 good/weak — ВСЕГДА принудительно приводим к пресету (даже если оригинал был бы меньше лимита),
+//                   и только потом, если пресет всё равно не влез — добиваем точным сжатием.
+// 🤖 auto — по убыванию: оригинал -> good -> weak, останавливаемся на первом, что влезло;
+//           если даже weak не влез — добиваем точным сжатием.
+async function prepareForQuality(remuxedPath, quality, chatId, statusMsgId, url) {
+  const onQueued = () => {
+    if (statusMsgId) {
+      bot.editMessageText(`⏳ ${url}\nВ очереди на обработку (сейчас обрабатывается другое видео)...`, { chat_id: chatId, message_id: statusMsgId, disable_web_page_preview: true }).catch(() => {});
+    }
+  };
+  const fits = (p) => fs.statSync(p).size <= MAX_TELEGRAM_BYTES;
+
+  if (quality === 'max') {
+    return fitAndCleanup(remuxedPath, chatId, statusMsgId, url);
+  }
+
+  if (quality === 'auto') {
+    if (fits(remuxedPath)) return remuxedPath;
+
+    let current = remuxedPath;
+    for (const tierKey of ['good', 'weak']) {
+      const tierPath = current.replace(/\.mp4$/, '') + `_${tierKey}.mp4`;
+      await runCompressionExclusive(() => transcodeToPreset(current, tierPath, tierKey, { chatId, statusMsgId, url }), onQueued);
+      if (fs.existsSync(current)) fs.unlinkSync(current);
+      current = tierPath;
+      if (fits(current)) return current;
+    }
+    // даже "слабое" не влезло — добиваем точным сжатием под байты
+    return fitAndCleanup(current, chatId, statusMsgId, url);
+  }
+
+  // 'weak' | 'good' — принудительный пресет, затем добивка под лимит при необходимости
+  const tierPath = remuxedPath.replace(/\.mp4$/, '') + `_${quality}.mp4`;
+  await runCompressionExclusive(() => transcodeToPreset(remuxedPath, tierPath, quality, { chatId, statusMsgId, url }), onQueued);
+  if (fs.existsSync(remuxedPath)) fs.unlinkSync(remuxedPath);
+  return fitAndCleanup(tierPath, chatId, statusMsgId, url);
+}
+
 // Один полный круг: спросить у провайдеров (параллельно) и отправить результат в Telegram.
-async function fetchAndSend(chatId, url, roundAttempt, statusMsgId) {
+async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
   const { version, media } = await fetchMediaAnyProvider(url);
   console.log(`ℹ️ [${url}] источник: ${version}${version === 'v1' ? ' (оригинал TikTok, может быть тяжёлым)' : ' (компактное зеркало)'}`);
 
@@ -522,7 +725,9 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId) {
   await remux(videoPath, remuxedPath);
   fs.unlinkSync(videoPath);
 
-  const sendPath = await ensureUnderTelegramLimit(remuxedPath, chatId, statusMsgId, url);
+  const quality = getUserQuality(userId);
+  console.log(`🎚 [${url}] выбранное качество: ${quality}`);
+  const sendPath = await prepareForQuality(remuxedPath, quality, chatId, statusMsgId, url);
 
   // Узнаём метаданные ИМЕННО того файла, который реально отправляем (после возможного сжатия
   // разрешение другое) — без явных duration/width/height Telegram нередко показывает видео
@@ -543,10 +748,10 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId) {
 
 // Повторяет ПОЛНЫЙ круг по всем провайдерам ещё раз, если с первого захода не вышло.
 // Управляет статус-сообщением: удаляет его при успехе, показывает ошибку при полном отказе.
-async function downloadWithRetry(chatId, url, statusMsgId) {
+async function downloadWithRetry(chatId, url, statusMsgId, userId) {
   for (let round = 1; round <= RETRY_ROUNDS; round++) {
     try {
-      await fetchAndSend(chatId, url, round, statusMsgId);
+      await fetchAndSend(chatId, url, round, statusMsgId, userId);
       if (statusMsgId) bot.deleteMessage(chatId, statusMsgId).catch(() => {});
       return;
     } catch (err) {
@@ -558,6 +763,12 @@ async function downloadWithRetry(chatId, url, statusMsgId) {
         } else {
           bot.sendMessage(chatId, failText, { disable_web_page_preview: true });
         }
+      } else {
+        // Небольшая пауза перед повтором — если первый заход упал из-за кратковременного
+        // сетевого сбоя у провайдера (Network error / 5xx), мгновенный повтор в ту же миллисекунду
+        // почти всегда попадёт в тот же сбой. 404 пауза не починит (значит видео реально недоступно),
+        // но и не навредит.
+        await new Promise(r => setTimeout(r, 3000));
       }
     }
   }
@@ -568,7 +779,7 @@ async function worker() {
   while (queue.length > 0) {
     const item = queue.shift();
     if (!item) return;
-    await downloadWithRetry(item.chatId, item.url, item.statusMsgId);
+    await downloadWithRetry(item.chatId, item.url, item.statusMsgId, item.userId);
   }
 }
 
