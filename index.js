@@ -107,8 +107,34 @@ async function writeToGithub(userId, userInfo) {
   } catch (err) { console.error('❌ Ошибка записи:', err.message); }
 }
 
-syncGitHubLists();
+syncGitHubLists().then(() => broadcastStartToEveryone());
 setInterval(syncGitHubLists, 300000); // Обновление раз в 5 минут
+
+// При каждом рестарте бота (например, редеплой на Render) — просто шлём ВСЕМ из белого списка
+// то же сообщение, что шлёт команда /start. Белый список тут только читается, ничего в нём
+// не меняется и никуда отдельно не сохраняется — при следующем рестарте разошлём заново, и это ОК.
+async function broadcastStartToEveryone() {
+  const ids = Array.from(ALLOWED_IDS).filter(id => !BANNED_IDS.has(id));
+  if (!ids.length) return;
+  console.log(`📣 Рестарт: шлю /start всем из белого списка (${ids.length} чел.)...`);
+
+  let sent = 0;
+  for (const id of ids) {
+    try {
+      const current = getUserQuality(id);
+      await bot.sendMessage(id,
+        `👋 Бот перезапущен и обновлён.\n\n⚙️ Текущее качество: ${QUALITY_LABELS[current]}\nПоменять — кнопкой "⚙️ Качество" снизу.`,
+        { reply_markup: { keyboard: [['⚙️ Качество']], resize_keyboard: true } }
+      );
+      sent++;
+    } catch (err) {
+      // юзер мог заблокировать бота/удалить чат — просто пропускаем, не критично
+      console.log(`⚠️ Не удалось отправить ${id}: ${err.message}`);
+    }
+    await new Promise(r => setTimeout(r, 40)); // ~25 сообщений/сек — не словить рейт-лимит Telegram на сотнях юзеров
+  }
+  console.log(`📣 Готово: ${sent}/${ids.length} доставлено`);
+}
 
 // Автопинг Render
 setInterval(() => {
