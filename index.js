@@ -482,13 +482,12 @@ async function probeVideoInfo(input) {
 // В любом случае логируем реальные строки Video/Audio из ffmpeg (полностью, без обрезки) —
 // если конкретное видео всё равно придёт файлом при "чистом" codec/pix_fmt/audio, у нас
 // в логах будет точная фактура, чтобы разобраться в реальной причине, а не гадать заново.
-// Выше этого битрейта Telegram-клиент, похоже, не успевает забуферить видео на лету и
-// показывает "нужно скачать" вместо мгновенного плеера (проверено фактическим сравнением:
-// 3672kb/s пришло файлом, 241kb/s — мгновенным плеером). Кап опирается на конкретные цифры
-// из логов, а не на догадку "на всякий случай" — трогает только реально тяжёлые по битрейту
-// видео, для абсолютного большинства роликов (обычный битрейт TikTok ниже) ничего не меняется.
-const STREAM_SAFE_BITRATE_KBPS = 2500;
-const STREAM_SAFE_TARGET_KBPS = 2000;
+// Официального порога от Telegram нет — это внутренняя логика их сервера, нигде не задокументированная.
+// Число ниже откалибровано по РЕАЛЬНЫМ замерам, а не с потолка: 3492kb/s — подтверждено, всегда
+// приходило видео; 3672kb/s — подтверждено, всегда приходило файлом. Порог поставлен между ними.
+// Если появятся новые погранично приходящие-файлом видео — подкорректируем по факту из логов.
+const STREAM_SAFE_BITRATE_KBPS = 3550;
+const STREAM_SAFE_TARGET_KBPS = 3000;
 
 async function remux(input, output, progressCtx) {
   const { stderr: probeStderr } = await runFfmpeg(['-i', input]);
@@ -802,8 +801,16 @@ async function tryDownloadCandidate(cand, url, roundAttempt) {
 }
 
 async function downloadFromAnyCandidate(url, roundAttempt) {
-  const settled = await Promise.allSettled(MIRROR_VERSIONS.map(v => fetchMedia(url, v)));
-  const mirrorCandidates = settled.filter(r => r.status === 'fulfilled').map(r => r.value);
+  // Promise.allSettled сохраняет порядок ВХОДНОГО массива (всегда v2, потом v3), а не порядок
+  // реального ответа — из-за этого v2 стал систематически побеждать там, где раньше (на Promise.any,
+  // гонке "кто быстрее ответит") иногда выигрывал v3, а у зеркал разное поведение по водяному знаку.
+  // Возвращаем порядок по факту ответа: пушим в arrivalOrder ровно в момент, когда конкретный
+  // provider реально зарезолвился — так первым кандидатом всегда будет тот, кто ответил быстрее.
+  const arrivalOrder = [];
+  const settled = await Promise.allSettled(MIRROR_VERSIONS.map(v =>
+    fetchMedia(url, v).then(res => { arrivalOrder.push(res); return res; })
+  ));
+  const mirrorCandidates = arrivalOrder;
   const mirrorErrors = settled.filter(r => r.status === 'rejected').map(r => r.reason);
 
   for (const cand of mirrorCandidates) {
