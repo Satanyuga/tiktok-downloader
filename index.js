@@ -476,29 +476,40 @@ async function probeVideoInfo(input) {
 // Чинит баг: некоторые провайдеры отдают mp4, в котором Telegram не видит длительность/превью
 // и показывает видео как "файл, надо скачать" вместо проигрываемого ролика.
 //
-// НО: если видеокодек не H.264 (например HEVC/h265 — такое иногда отдаёт CDN TikTok), простого
-// копирования потоков недостаточно — Telegram на части клиентов не проигрывает такое инлайн и
-// тоже показывает его как обычный файл, даже с faststart. В этом случае перекодируем в h264.
+// НО простого faststart+copy недостаточно, если исходник не строго "телеграм-совместимый":
+// Telegram инлайн проигрывает только H.264 + 8-битный yuv420p + AAC-аудио (или без звука).
+// Если CDN отдал HEVC/h265, ЛИБО h264 но в 10-битном/4:2:2/4:4:4 пиксель-формате (High10/422/444
+// профиль — иногда бывает у TikTok), ЛИБО аудио не AAC (например Opus/MP3 в mp4-контейнере) —
+// часть Telegram-клиентов покажет ролик как обычный файл, даже с идеальным faststart.
+// В любом из этих случаев принудительно перекодируем в "безопасный" набор: h264 + yuv420p + aac.
 async function remux(input, output) {
   const { stderr: probeStderr } = await runFfmpeg(['-i', input]);
-  const codecMatch = probeStderr.match(/Video:\s*([a-zA-Z0-9_]+)/);
-  const codec = codecMatch ? codecMatch[1].toLowerCase() : null;
+  const videoLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Video:[^\n]*/) || [''])[0];
+  const audioLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Audio:[^\n]*/) || [''])[0];
 
-  if (codec && codec !== 'h264') {
-    console.log(`ℹ️ remux: видеокодек ${codec} (не h264) — перекодирую в h264, иначе часть Telegram-клиентов покажет видео как файл`);
-    const { code, stderr } = await runFfmpeg([
-      '-y', '-i', input,
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-      '-c:a', 'aac', '-b:a', '160k',
-      '-movflags', '+faststart',
-      output
-    ]);
-    if (code !== 0) throw new Error(`remux(${codec}->h264) exit ${code}: ${stderr.slice(-300)}`);
+  const isH264 = /Video:\s*h264/i.test(videoLine);
+  const isStandardPixFmt = /yuv420p(?!\w)/i.test(videoLine) || /yuvj420p/i.test(videoLine);
+  const isAacOrNoAudio = audioLine === '' || /Audio:\s*aac/i.test(audioLine);
+
+  if (isH264 && isStandardPixFmt && isAacOrNoAudio) {
+    const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
+    if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
     return;
   }
 
-  const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
-  if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
+  const reason = !isH264 ? `видеокодек не h264 (${videoLine.slice(0, 80)})`
+    : !isStandardPixFmt ? `нестандартный формат пикселей (${videoLine.slice(0, 80)})`
+    : `аудио не AAC (${audioLine.slice(0, 80)})`;
+  console.log(`ℹ️ remux: ${reason} — перекодирую в безопасный h264/yuv420p/aac, иначе часть Telegram-клиентов покажет видео как файл`);
+
+  const { code, stderr } = await runFfmpeg([
+    '-y', '-i', input,
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '160k',
+    '-movflags', '+faststart',
+    output
+  ]);
+  if (code !== 0) throw new Error(`remux(force-transcode) exit ${code}: ${stderr.slice(-300)}`);
 }
 
 function formatEta(sec) {
