@@ -490,7 +490,7 @@ async function probeVideoInfo(input) {
 const STREAM_SAFE_BITRATE_KBPS = 2500;
 const STREAM_SAFE_TARGET_KBPS = 2000;
 
-async function remux(input, output) {
+async function remux(input, output, progressCtx) {
   const { stderr: probeStderr } = await runFfmpeg(['-i', input]);
   const videoLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Video:[^\n]*/) || [''])[0];
   const audioLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Audio:[^\n]*/) || [''])[0];
@@ -524,13 +524,34 @@ async function remux(input, output) {
     ? ['-c:v', 'libx264', '-preset', 'veryfast', '-b:v', `${STREAM_SAFE_TARGET_KBPS}k`, '-maxrate', `${Math.round(STREAM_SAFE_TARGET_KBPS * 1.15)}k`, '-bufsize', `${STREAM_SAFE_TARGET_KBPS * 2}k`, '-pix_fmt', 'yuv420p']
     : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p'];
 
+  // Живой прогресс в процентах — точно так же, как при сжатии под лимит Telegram, чтобы и в
+  // логах, и в статусе у пользователя в чате было видно, что процесс реально идёт, а не завис.
+  const durMatch = probeStderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  const duration = durMatch ? (+durMatch[1]) * 3600 + (+durMatch[2]) * 60 + parseFloat(durMatch[3]) : 60;
+  let lastEditAt = 0;
+  const onProgress = (t, speed) => {
+    const now = Date.now();
+    if (now - lastEditAt < 6000) return;
+    lastEditAt = now;
+    const pct = Math.min(99, Math.round((t / duration) * 100));
+    const etaSec = speed > 0 ? (duration - t) / speed : null;
+    console.log(`📊 [${progressCtx?.url || input}] подготовка видео: ${pct}%`);
+    if (progressCtx?.statusMsgId) {
+      const etaText = etaSec != null ? formatEta(etaSec) : 'считаю...';
+      bot.editMessageText(
+        `🎛 ${progressCtx.url}\nВидео тяжёлое — готовлю его к отправке...\n⏱ ${pct}%, осталось ${etaText}`,
+        { chat_id: progressCtx.chatId, message_id: progressCtx.statusMsgId, disable_web_page_preview: true }
+      ).catch(() => {});
+    }
+  };
+
   const { code, stderr } = await runFfmpeg([
     '-y', '-i', input,
     ...videoArgs,
     '-c:a', 'aac', '-b:a', '160k',
     '-movflags', '+faststart',
     output
-  ], () => {}, { stallMs: COMPRESS_STALL_MS, absoluteMs: COMPRESS_ABSOLUTE_MS });
+  ], onProgress, { stallMs: COMPRESS_STALL_MS, absoluteMs: COMPRESS_ABSOLUTE_MS });
   if (code === 'timeout:stall') throw new Error('remux: завис, процесс убит');
   if (code === 'timeout:absolute') throw new Error('remux: превышен потолок времени');
   if (code !== 0) throw new Error(`remux(force-transcode) exit ${code}: ${stderr.slice(-300)}`);
@@ -819,7 +840,7 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
   // как "файл, нужно скачать" вместо проигрываемого ролика. Это ремукс, не перекодирование:
   // быстро и без малейшей потери качества.
   const remuxedPath = videoPath.replace(/\.mp4$/, '') + '_r.mp4';
-  await remux(videoPath, remuxedPath);
+  await remux(videoPath, remuxedPath, { chatId, statusMsgId, url });
   fs.unlinkSync(videoPath);
 
   const quality = getUserQuality(userId);
