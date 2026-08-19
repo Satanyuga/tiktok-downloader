@@ -107,34 +107,8 @@ async function writeToGithub(userId, userInfo) {
   } catch (err) { console.error('❌ Ошибка записи:', err.message); }
 }
 
-syncGitHubLists().then(() => broadcastStartToEveryone());
+syncGitHubLists();
 setInterval(syncGitHubLists, 300000); // Обновление раз в 5 минут
-
-// При каждом рестарте бота (например, редеплой на Render) — просто шлём ВСЕМ из белого списка
-// то же сообщение, что шлёт команда /start. Белый список тут только читается, ничего в нём
-// не меняется и никуда отдельно не сохраняется — при следующем рестарте разошлём заново, и это ОК.
-async function broadcastStartToEveryone() {
-  const ids = Array.from(ALLOWED_IDS).filter(id => !BANNED_IDS.has(id));
-  if (!ids.length) return;
-  console.log(`📣 Рестарт: шлю /start всем из белого списка (${ids.length} чел.)...`);
-
-  let sent = 0;
-  for (const id of ids) {
-    try {
-      const current = getUserQuality(id);
-      await bot.sendMessage(id,
-        `👋 Бот перезапущен и обновлён.\n\n⚙️ Текущее качество: ${QUALITY_LABELS[current]}\nПоменять — кнопкой "⚙️ Качество" снизу.`,
-        { reply_markup: { keyboard: [['⚙️ Качество']], resize_keyboard: true } }
-      );
-      sent++;
-    } catch (err) {
-      // юзер мог заблокировать бота/удалить чат — просто пропускаем, не критично
-      console.log(`⚠️ Не удалось отправить ${id}: ${err.message}`);
-    }
-    await new Promise(r => setTimeout(r, 40)); // ~25 сообщений/сек — не словить рейт-лимит Telegram на сотнях юзеров
-  }
-  console.log(`📣 Готово: ${sent}/${ids.length} доставлено`);
-}
 
 // Автопинг Render
 setInterval(() => {
@@ -366,19 +340,7 @@ async function fetchMedia(url, version) {
 const MIRROR_VERSIONS = ['v2', 'v3'];
 const FALLBACK_VERSION = 'v1';
 
-async function fetchMediaAnyProvider(url) {
-  try {
-    return await Promise.any(MIRROR_VERSIONS.map(v => fetchMedia(url, v)));
-  } catch (aggErr) {
-    console.log(`ℹ️ [${url}] компактные зеркала (v2/v3) не сработали — пробую ${FALLBACK_VERSION} (оригинал, может быть тяжелее)`);
-    try {
-      return await fetchMedia(url, FALLBACK_VERSION);
-    } catch (fallbackErr) {
-      const details = [...(aggErr.errors || [aggErr]), fallbackErr].map(e => e.message).join(' | ');
-      throw new Error(`все провайдеры отказали: ${details}`);
-    }
-  }
-}
+// (старая fetchMediaAnyProvider удалена — логика с фолбэком внутри круга теперь в downloadFromAnyCandidate ниже)
 
 // Скачивает файл по ссылке и проверяет, что это ДЕЙСТВИТЕЛЬНО видео, а не HTML-заглушка
 // (некоторые CDN без правильного Referer отдают страницу "доступ запрещён" вместо mp4 —
@@ -511,9 +473,30 @@ async function probeVideoInfo(input) {
 }
 
 // Перекладывает контейнер (moov atom в начало) БЕЗ перекодирования — мгновенно и без потери качества.
-// Чинит конкретный баг: некоторые провайдеры отдают mp4, в котором Telegram не видит длительность/превью
+// Чинит баг: некоторые провайдеры отдают mp4, в котором Telegram не видит длительность/превью
 // и показывает видео как "файл, надо скачать" вместо проигрываемого ролика.
+//
+// НО: если видеокодек не H.264 (например HEVC/h265 — такое иногда отдаёт CDN TikTok), простого
+// копирования потоков недостаточно — Telegram на части клиентов не проигрывает такое инлайн и
+// тоже показывает его как обычный файл, даже с faststart. В этом случае перекодируем в h264.
 async function remux(input, output) {
+  const { stderr: probeStderr } = await runFfmpeg(['-i', input]);
+  const codecMatch = probeStderr.match(/Video:\s*([a-zA-Z0-9_]+)/);
+  const codec = codecMatch ? codecMatch[1].toLowerCase() : null;
+
+  if (codec && codec !== 'h264') {
+    console.log(`ℹ️ remux: видеокодек ${codec} (не h264) — перекодирую в h264, иначе часть Telegram-клиентов покажет видео как файл`);
+    const { code, stderr } = await runFfmpeg([
+      '-y', '-i', input,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+      '-c:a', 'aac', '-b:a', '160k',
+      '-movflags', '+faststart',
+      output
+    ]);
+    if (code !== 0) throw new Error(`remux(${codec}->h264) exit ${code}: ${stderr.slice(-300)}`);
+    return;
+  }
+
   const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
   if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
 }
@@ -729,19 +712,60 @@ async function prepareForQuality(remuxedPath, quality, chatId, statusMsgId, url)
   return fitAndCleanup(tierPath, chatId, statusMsgId, url);
 }
 
-// Один полный круг: спросить у провайдеров (параллельно) и отправить результат в Telegram.
-async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
-  const { version, media } = await fetchMediaAnyProvider(url);
-  console.log(`ℹ️ [${url}] источник: ${version}${version === 'v1' ? ' (оригинал TikTok, может быть тяжёлым)' : ' (компактное зеркало)'}`);
+// Раньше "провайдер ответил, но скачивание не удалось" (например, битая/просроченная ссылка от v3 —
+// 0 байт или 404) валило весь круг попыток целиком, а на следующем круге код снова брал ТОГО ЖЕ
+// провайдера — и с высокой вероятностью падал точно так же. Теперь при неудаче скачивания
+// пробуем остальных провайдеров СРАЗУ, в рамках этого же круга: сначала все, кто ответил среди
+// v2/v3 (могли ответить оба — используем второго как запасной), и только если ни один компактный
+// источник не подошёл — идём в v1 (оригинал).
+async function tryDownloadCandidate(cand, url, roundAttempt) {
+  if (cand.media.images) return { ok: true, images: cand.media.images };
+  const videoPath = path.resolve(__dirname, `v_${Date.now()}_${roundAttempt}_${cand.version}.mp4`);
+  try {
+    await downloadAndValidate(cand.media.video, cand.version, videoPath);
+    console.log(`ℹ️ [${url}] скачано (${cand.version}): ${(fs.statSync(videoPath).size / 1024 / 1024).toFixed(1)}MB`);
+    return { ok: true, videoPath, version: cand.version };
+  } catch (err) {
+    console.log(`⚠️ [${url}] ${cand.version} ответил, но скачать не вышло (${err.message}) — пробую следующего провайдера в этом же круге`);
+    if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+    return { ok: false, err };
+  }
+}
 
-  if (media.images) {
-    for (const imgUrl of media.images) await bot.sendPhoto(chatId, imgUrl);
+async function downloadFromAnyCandidate(url, roundAttempt) {
+  const settled = await Promise.allSettled(MIRROR_VERSIONS.map(v => fetchMedia(url, v)));
+  const mirrorCandidates = settled.filter(r => r.status === 'fulfilled').map(r => r.value);
+  const mirrorErrors = settled.filter(r => r.status === 'rejected').map(r => r.reason);
+
+  for (const cand of mirrorCandidates) {
+    const result = await tryDownloadCandidate(cand, url, roundAttempt);
+    if (result.ok) return result;
+    mirrorErrors.push(result.err);
+  }
+
+  console.log(`ℹ️ [${url}] компактные зеркала (v2/v3) не сработали — пробую ${FALLBACK_VERSION} (оригинал, может быть тяжелее)`);
+  let fallbackCand;
+  try {
+    fallbackCand = await fetchMedia(url, FALLBACK_VERSION);
+  } catch (err) {
+    throw new Error(`все провайдеры отказали: ${[...mirrorErrors, err].map(e => e.message).join(' | ')}`);
+  }
+  const result = await tryDownloadCandidate(fallbackCand, url, roundAttempt);
+  if (result.ok) return result;
+  throw new Error(`все провайдеры отказали: ${[...mirrorErrors, result.err].map(e => e.message).join(' | ')}`);
+}
+
+// Один полный круг: спросить у провайдеров (параллельно, с фолбэком внутри круга) и отправить результат в Telegram.
+async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
+  const result = await downloadFromAnyCandidate(url, roundAttempt);
+
+  if (result.images) {
+    for (const imgUrl of result.images) await bot.sendPhoto(chatId, imgUrl);
     return;
   }
 
-  const videoPath = path.resolve(__dirname, `v_${Date.now()}_${roundAttempt}.mp4`);
-  await downloadAndValidate(media.video, version, videoPath);
-  console.log(`ℹ️ [${url}] скачано (${version}): ${(fs.statSync(videoPath).size / 1024 / 1024).toFixed(1)}MB`);
+  const { videoPath, version } = result;
+  console.log(`ℹ️ [${url}] источник: ${version}${version === 'v1' ? ' (оригинал TikTok, может быть тяжёлым)' : ' (компактное зеркало)'}`);
 
   // Всегда чиним контейнер (faststart) — без этого часть видео Telegram показывает
   // как "файл, нужно скачать" вместо проигрываемого ролика. Это ремукс, не перекодирование:
