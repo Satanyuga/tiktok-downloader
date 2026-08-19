@@ -478,8 +478,8 @@ async function probeVideoInfo(input) {
 // Порог по прямому указанию: 3500 kb/s. Разрешение и всё остальное видео НЕ меняются —
 // только -b:v/-maxrate ограничивают битрейт сверху, чтобы не переперекодировать зря
 // то, что и так укладывается.
-const STREAM_SAFE_BITRATE_KBPS = 3500;
-const STREAM_SAFE_TARGET_KBPS = 3000;
+const STREAM_SAFE_BITRATE_KBPS = 5500;
+const STREAM_SAFE_TARGET_KBPS = 5000;
 
 async function remux(input, output, progressCtx) {
   const { stderr: probeStderr } = await runFfmpeg(['-i', input]);
