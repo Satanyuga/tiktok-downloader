@@ -312,8 +312,10 @@ function extractMedia(version, result) {
     videoUrl = result.video?.playAddr?.[0] || result.video?.downloadAddr?.[0];
   } else if (version === 'v2') { // ssstik — сервис-зеркало, обычно уже ужатая для шаринга версия
     videoUrl = result.video?.playAddr || result.direct;
-  } else if (version === 'v3') { // musicaldown — у него только 2 варианта: HD (тяжёлый) или watermark (компактный)
-    videoUrl = result.videoWatermark || result.videoHD; // берём компактный первым — размер важнее вотемарки
+  } else if (version === 'v3') { // musicaldown — HD (без вотемарки) или watermark. Вотемарка НЕДОПУСТИМА
+    // ни при каких условиях. Если HD-варианта нет вообще — этот источник считается несостоявшимся
+    // (videoUrl остаётся null), а НЕ тихо соглашается на вотемарку. Дальше код сам уйдёт на v2/v1.
+    videoUrl = result.videoHD || null;
   }
 
   if (videoUrl) return { video: videoUrl };
@@ -472,88 +474,24 @@ async function probeVideoInfo(input) {
   };
 }
 
-// Перекладывает контейнер (moov atom в начало) БЕЗ перекодирования в большинстве случаев —
-// мгновенно и без потери качества. Полное перекодирование КАЖДОГО видео "на всякий случай"
-// не делаем — это в разы дороже по CPU/времени на слабом сервере, а нужно оно только редким
-// исключениям.
-//
-// Telegram инлайн стабильно проигрывает h264 + 8-битный yuv420p + AAC. Если видео этому не
-// соответствует (HEVC/10-бит/4:2:2/4:4:4/не-AAC звук) — перекодируем ТОЛЬКО такое видео.
-// В любом случае логируем реальные строки Video/Audio из ffmpeg (полностью, без обрезки) —
-// если конкретное видео всё равно придёт файлом при "чистом" codec/pix_fmt/audio, у нас
-// в логах будет точная фактура, чтобы разобраться в реальной причине, а не гадать заново.
-// Официального порога от Telegram нет — это внутренняя логика их сервера, нигде не задокументированная.
-// Число ниже откалибровано по РЕАЛЬНЫМ замерам, а не с потолка: 3492kb/s — подтверждено, всегда
-// приходило видео; 3672kb/s — подтверждено, всегда приходило файлом. Порог поставлен между ними.
-// Если появятся новые погранично приходящие-файлом видео — подкорректируем по факту из логов.
-const STREAM_SAFE_BITRATE_KBPS = 3550;
-const STREAM_SAFE_TARGET_KBPS = 3000;
-
-async function remux(input, output, progressCtx) {
+// По прямому указанию: НИКАКОГО перекодирования "на всякий случай". Причина, по которой Telegram
+// иногда показывает видео как файл, НЕ разгадана — попытки завязаться на битрейт провалились
+// (проверено реальными данными: видео с БОЛЬШИМ битрейтом 3492kb/s приходило нормально, видео
+// с МЕНЬШИМ битрейтом 3249kb/s — файлом; это не "неверно откалиброванный порог", это доказательство,
+// что битрейт вообще не тот параметр, от которого это зависит). Дальше гадать порогами не будем.
+// Оставляем только: (1) быстрое копирование потока с faststart — как было изначально, без
+// перекодирования; (2) диагностический лог реальных Video/Audio-строк источника — это просто чтение
+// метаданных через ffprobe, не перекодирование, стоит копейки CPU и пригодится, если понадобятся
+// новые данные для анализа проблемы.
+async function remux(input, output) {
   const { stderr: probeStderr } = await runFfmpeg(['-i', input]);
   const videoLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Video:[^\n]*/) || [''])[0];
   const audioLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Audio:[^\n]*/) || [''])[0];
-  const rotateLine = (probeStderr.match(/rotate\s*:\s*-?\d+/i) || [''])[0];
-  console.log(`🔬 [remux-probe] video="${videoLine}" audio="${audioLine}" ${rotateLine ? `rotate="${rotateLine}"` : ''}`);
+  console.log(`🔬 [remux-probe] video="${videoLine}" audio="${audioLine}"`);
 
-  const isH264 = /Video:\s*h264/i.test(videoLine);
-  const isStandardPixFmt = /yuv420p(?!\w)/i.test(videoLine) || /yuvj420p/i.test(videoLine);
-  const isAacOrNoAudio = audioLine === '' || /Audio:\s*aac/i.test(audioLine);
-  const bitrateMatch = videoLine.match(/(\d+)\s*kb\/s/);
-  const videoKbps = bitrateMatch ? parseInt(bitrateMatch[1], 10) : null;
-  const isSafeBitrate = !videoKbps || videoKbps <= STREAM_SAFE_BITRATE_KBPS;
-
-  if (isH264 && isStandardPixFmt && isAacOrNoAudio && isSafeBitrate) {
-    const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
-    if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
-    return;
-  }
-
-  let reason;
-  if (!isH264) reason = 'видеокодек не h264';
-  else if (!isStandardPixFmt) reason = 'нестандартный формат пикселей';
-  else if (!isAacOrNoAudio) reason = 'аудио не AAC';
-  else reason = `битрейт ${videoKbps}kb/s выше безопасного порога ${STREAM_SAFE_BITRATE_KBPS}kb/s`;
-  console.log(`ℹ️ remux: ${reason} — перекодирую`);
-
-  // Для случая "просто высокий битрейт" (кодек и так корректный) держим оригинальное разрешение,
-  // просто ограничиваем битрейт — это дешевле по CPU, чем полный crf-энкод, и не режет резкость.
-  const isBitrateOnlyIssue = isH264 && isStandardPixFmt && isAacOrNoAudio && !isSafeBitrate;
-  const videoArgs = isBitrateOnlyIssue
-    ? ['-c:v', 'libx264', '-preset', 'veryfast', '-b:v', `${STREAM_SAFE_TARGET_KBPS}k`, '-maxrate', `${Math.round(STREAM_SAFE_TARGET_KBPS * 1.15)}k`, '-bufsize', `${STREAM_SAFE_TARGET_KBPS * 2}k`, '-pix_fmt', 'yuv420p']
-    : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p'];
-
-  // Живой прогресс в процентах — точно так же, как при сжатии под лимит Telegram, чтобы и в
-  // логах, и в статусе у пользователя в чате было видно, что процесс реально идёт, а не завис.
-  const durMatch = probeStderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
-  const duration = durMatch ? (+durMatch[1]) * 3600 + (+durMatch[2]) * 60 + parseFloat(durMatch[3]) : 60;
-  let lastEditAt = 0;
-  const onProgress = (t, speed) => {
-    const now = Date.now();
-    if (now - lastEditAt < 6000) return;
-    lastEditAt = now;
-    const pct = Math.min(99, Math.round((t / duration) * 100));
-    const etaSec = speed > 0 ? (duration - t) / speed : null;
-    console.log(`📊 [${progressCtx?.url || input}] подготовка видео: ${pct}%`);
-    if (progressCtx?.statusMsgId) {
-      const etaText = etaSec != null ? formatEta(etaSec) : 'считаю...';
-      bot.editMessageText(
-        `🎛 ${progressCtx.url}\nВидео тяжёлое — готовлю его к отправке...\n⏱ ${pct}%, осталось ${etaText}`,
-        { chat_id: progressCtx.chatId, message_id: progressCtx.statusMsgId, disable_web_page_preview: true }
-      ).catch(() => {});
-    }
-  };
-
-  const { code, stderr } = await runFfmpeg([
-    '-y', '-i', input,
-    ...videoArgs,
-    '-c:a', 'aac', '-b:a', '160k',
-    '-movflags', '+faststart',
-    output
-  ], onProgress, { stallMs: COMPRESS_STALL_MS, absoluteMs: COMPRESS_ABSOLUTE_MS });
-  if (code === 'timeout:stall') throw new Error('remux: завис, процесс убит');
-  if (code === 'timeout:absolute') throw new Error('remux: превышен потолок времени');
-  if (code !== 0) throw new Error(`remux(force-transcode) exit ${code}: ${stderr.slice(-300)}`);
+  const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
+  if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
+  if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
 }
 
 // Достаёт один кадр из видео как JPEG для передачи Telegram явным превью.
@@ -801,16 +739,16 @@ async function tryDownloadCandidate(cand, url, roundAttempt) {
 }
 
 async function downloadFromAnyCandidate(url, roundAttempt) {
-  // Promise.allSettled сохраняет порядок ВХОДНОГО массива (всегда v2, потом v3), а не порядок
-  // реального ответа — из-за этого v2 стал систематически побеждать там, где раньше (на Promise.any,
-  // гонке "кто быстрее ответит") иногда выигрывал v3, а у зеркал разное поведение по водяному знаку.
-  // Возвращаем порядок по факту ответа: пушим в arrivalOrder ровно в момент, когда конкретный
-  // provider реально зарезолвился — так первым кандидатом всегда будет тот, кто ответил быстрее.
-  const arrivalOrder = [];
-  const settled = await Promise.allSettled(MIRROR_VERSIONS.map(v =>
-    fetchMedia(url, v).then(res => { arrivalOrder.push(res); return res; })
-  ));
-  const mirrorCandidates = arrivalOrder;
+  // ВАЖНО: специально НЕ используем порядок "кто из v2/v3 ответил быстрее" (гонку/race) —
+  // из-за этого одна и та же ссылка на разных попытках отдавала физически РАЗНЫЕ файлы
+  // (разное разрешение и битрейт от разных зеркал), что превращало отладку в хаос: невозможно
+  // было понять, воспроизводится ли проблема на одном и том же видео или это просто повезло/не
+  // повезло с тем, какое зеркало выиграло гонку в этот раз. Настоящий фикс вотемарки — это
+  // приоритет videoHD в extractMedia (см. выше), гонка для него не нужна. Порядок всегда
+  // фиксированный, по MIRROR_VERSIONS: сначала v2, потом v3 — одна и та же ссылка стабильно
+  // даёт один и тот же результат между попытками, что критично для диагностики.
+  const settled = await Promise.allSettled(MIRROR_VERSIONS.map(v => fetchMedia(url, v)));
+  const mirrorCandidates = settled.filter(r => r.status === 'fulfilled').map(r => r.value);
   const mirrorErrors = settled.filter(r => r.status === 'rejected').map(r => r.reason);
 
   for (const cand of mirrorCandidates) {
@@ -843,11 +781,10 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
   const { videoPath, version } = result;
   console.log(`ℹ️ [${url}] источник: ${version}${version === 'v1' ? ' (оригинал TikTok, может быть тяжёлым)' : ' (компактное зеркало)'}`);
 
-  // Всегда чиним контейнер (faststart) — без этого часть видео Telegram показывает
-  // как "файл, нужно скачать" вместо проигрываемого ролика. Это ремукс, не перекодирование:
-  // быстро и без малейшей потери качества.
+  // Копирование потока (без перекодирования) — быстро, не грузит CPU, поэтому НЕ ставим
+  // это в очередь эксклюзивного доступа (та нужна только реальным перекодированиям).
   const remuxedPath = videoPath.replace(/\.mp4$/, '') + '_r.mp4';
-  await remux(videoPath, remuxedPath, { chatId, statusMsgId, url });
+  await remux(videoPath, remuxedPath);
   fs.unlinkSync(videoPath);
 
   const quality = getUserQuality(userId);
