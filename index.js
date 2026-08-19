@@ -472,20 +472,22 @@ async function probeVideoInfo(input) {
   };
 }
 
-// Перекладывает контейнер (moov atom в начало) БЕЗ перекодирования — мгновенно и без потери качества.
-// Чинит баг: некоторые провайдеры отдают mp4, в котором Telegram не видит длительность/превью
-// и показывает видео как "файл, надо скачать" вместо проигрываемого ролика.
+// Перекладывает контейнер (moov atom в начало) БЕЗ перекодирования в большинстве случаев —
+// мгновенно и без потери качества. Полное перекодирование КАЖДОГО видео "на всякий случай"
+// не делаем — это в разы дороже по CPU/времени на слабом сервере, а нужно оно только редким
+// исключениям.
 //
-// НО простого faststart+copy недостаточно, если исходник не строго "телеграм-совместимый":
-// Telegram инлайн проигрывает только H.264 + 8-битный yuv420p + AAC-аудио (или без звука).
-// Если CDN отдал HEVC/h265, ЛИБО h264 но в 10-битном/4:2:2/4:4:4 пиксель-формате (High10/422/444
-// профиль — иногда бывает у TikTok), ЛИБО аудио не AAC (например Opus/MP3 в mp4-контейнере) —
-// часть Telegram-клиентов покажет ролик как обычный файл, даже с идеальным faststart.
-// В любом из этих случаев принудительно перекодируем в "безопасный" набор: h264 + yuv420p + aac.
+// Telegram инлайн стабильно проигрывает h264 + 8-битный yuv420p + AAC. Если видео этому не
+// соответствует (HEVC/10-бит/4:2:2/4:4:4/не-AAC звук) — перекодируем ТОЛЬКО такое видео.
+// В любом случае логируем реальные строки Video/Audio из ffmpeg (полностью, без обрезки) —
+// если конкретное видео всё равно придёт файлом при "чистом" codec/pix_fmt/audio, у нас
+// в логах будет точная фактура, чтобы разобраться в реальной причине, а не гадать заново.
 async function remux(input, output) {
   const { stderr: probeStderr } = await runFfmpeg(['-i', input]);
   const videoLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Video:[^\n]*/) || [''])[0];
   const audioLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Audio:[^\n]*/) || [''])[0];
+  const rotateLine = (probeStderr.match(/rotate\s*:\s*-?\d+/i) || [''])[0];
+  console.log(`🔬 [remux-probe] video="${videoLine}" audio="${audioLine}" ${rotateLine ? `rotate="${rotateLine}"` : ''}`);
 
   const isH264 = /Video:\s*h264/i.test(videoLine);
   const isStandardPixFmt = /yuv420p(?!\w)/i.test(videoLine) || /yuvj420p/i.test(videoLine);
@@ -497,19 +499,31 @@ async function remux(input, output) {
     return;
   }
 
-  const reason = !isH264 ? `видеокодек не h264 (${videoLine.slice(0, 80)})`
-    : !isStandardPixFmt ? `нестандартный формат пикселей (${videoLine.slice(0, 80)})`
-    : `аудио не AAC (${audioLine.slice(0, 80)})`;
-  console.log(`ℹ️ remux: ${reason} — перекодирую в безопасный h264/yuv420p/aac, иначе часть Telegram-клиентов покажет видео как файл`);
-
+  const reason = !isH264 ? `видеокодек не h264` : !isStandardPixFmt ? `нестандартный формат пикселей` : `аудио не AAC`;
+  console.log(`ℹ️ remux: ${reason} — перекодирую в безопасный h264/yuv420p/aac`);
   const { code, stderr } = await runFfmpeg([
     '-y', '-i', input,
     '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '160k',
     '-movflags', '+faststart',
     output
-  ]);
+  ], null, { stallMs: COMPRESS_STALL_MS, absoluteMs: COMPRESS_ABSOLUTE_MS });
+  if (code === 'timeout:stall') throw new Error('remux: завис, процесс убит');
+  if (code === 'timeout:absolute') throw new Error('remux: превышен потолок времени');
   if (code !== 0) throw new Error(`remux(force-transcode) exit ${code}: ${stderr.slice(-300)}`);
+}
+
+// Достаёт один кадр из видео как JPEG для передачи Telegram явным превью.
+// Дёшево (доли секунды), не требует перекодирования всего видео.
+// Реальная вероятная причина "видео без превью выглядит как файл": Telegram сам не смог
+// вытащить thumbnail из этого конкретного видео (нестандартный первый кадр/цветовой профиль
+// исходника) — тогда клиент рисует пустой блок с иконкой "скачать" вместо плеера с превью,
+// хотя формально это видео-сообщение, а не документ.
+async function extractThumbnail(input) {
+  const thumbPath = input.replace(/\.mp4$/, '') + '_thumb.jpg';
+  const { code } = await runFfmpeg(['-y', '-ss', '0.5', '-i', input, '-frames:v', '1', '-vf', 'scale=320:-1', thumbPath]);
+  if (code !== 0 || !fs.existsSync(thumbPath)) return null;
+  return thumbPath;
 }
 
 function formatEta(sec) {
@@ -793,15 +807,26 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
   // разрешение другое) — без явных duration/width/height Telegram нередко показывает видео
   // как "файл, нужно скачать" вместо проигрываемого ролика, даже если сам контейнер в порядке.
   const sendInfo = await probeVideoInfo(sendPath);
+  console.log(`🔬 [${url}] метаданные для отправки: duration=${sendInfo.duration} width=${sendInfo.width} height=${sendInfo.height}`);
+
+  // Явно достаём кадр и передаём его как превью. Полагаться на автогенерацию превью Telegram
+  // не будем: если её сорвёт на конкретном видео (нестандартный первый кадр/цветовой профиль),
+  // клиент рисует пустой блок с иконкой "скачать" вместо плеера — визуально неотличимо от документа,
+  // хотя формально это видео-сообщение.
+  const thumbPath = await extractThumbnail(sendPath);
+  console.log(`🔬 [${url}] превью-кадр: ${thumbPath ? 'сгенерирован' : 'НЕ УДАЛОСЬ сгенерировать'}`);
+
   // Имя файла как раньше (v_<timestamp>.mp4) — статичное "video.mp4" было заменой без причины.
   const displayName = `v_${Date.now()}.mp4`;
   await bot.sendVideo(chatId, sendPath, {
     supports_streaming: true,
     duration: sendInfo.duration ? Math.round(sendInfo.duration) : undefined,
     width: sendInfo.width || undefined,
-    height: sendInfo.height || undefined
+    height: sendInfo.height || undefined,
+    thumb: thumbPath || undefined
   }, { filename: displayName, contentType: 'video/mp4' });
 
+  if (thumbPath && fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
   if (fs.existsSync(remuxedPath)) fs.unlinkSync(remuxedPath);
   if (sendPath !== remuxedPath && fs.existsSync(sendPath)) fs.unlinkSync(sendPath);
 }
