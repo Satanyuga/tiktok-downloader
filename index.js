@@ -530,7 +530,7 @@ async function remux(input, output) {
     '-c:a', 'aac', '-b:a', '160k',
     '-movflags', '+faststart',
     output
-  ], null, { stallMs: COMPRESS_STALL_MS, absoluteMs: COMPRESS_ABSOLUTE_MS });
+  ], () => {}, { stallMs: COMPRESS_STALL_MS, absoluteMs: COMPRESS_ABSOLUTE_MS });
   if (code === 'timeout:stall') throw new Error('remux: завис, процесс убит');
   if (code === 'timeout:absolute') throw new Error('remux: превышен потолок времени');
   if (code !== 0) throw new Error(`remux(force-transcode) exit ${code}: ${stderr.slice(-300)}`);
