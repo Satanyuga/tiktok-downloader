@@ -474,23 +474,68 @@ async function probeVideoInfo(input) {
   };
 }
 
-// По прямому указанию: НИКАКОГО перекодирования "на всякий случай". Причина, по которой Telegram
-// иногда показывает видео как файл, НЕ разгадана — попытки завязаться на битрейт провалились
-// (проверено реальными данными: видео с БОЛЬШИМ битрейтом 3492kb/s приходило нормально, видео
-// с МЕНЬШИМ битрейтом 3249kb/s — файлом; это не "неверно откалиброванный порог", это доказательство,
-// что битрейт вообще не тот параметр, от которого это зависит). Дальше гадать порогами не будем.
-// Оставляем только: (1) быстрое копирование потока с faststart — как было изначально, без
-// перекодирования; (2) диагностический лог реальных Video/Audio-строк источника — это просто чтение
-// метаданных через ffprobe, не перекодирование, стоит копейки CPU и пригодится, если понадобятся
-// новые данные для анализа проблемы.
-async function remux(input, output) {
+// Сжимаем ТОЛЬКО битрейт видео, и ТОЛЬКО если он выше порога — ничего больше не трогаем.
+// Порог по прямому указанию: 3500 kb/s. Разрешение и всё остальное видео НЕ меняются —
+// только -b:v/-maxrate ограничивают битрейт сверху, чтобы не переперекодировать зря
+// то, что и так укладывается.
+const STREAM_SAFE_BITRATE_KBPS = 3500;
+const STREAM_SAFE_TARGET_KBPS = 3000;
+
+async function remux(input, output, progressCtx) {
   const { stderr: probeStderr } = await runFfmpeg(['-i', input]);
   const videoLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Video:[^\n]*/) || [''])[0];
   const audioLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Audio:[^\n]*/) || [''])[0];
   console.log(`🔬 [remux-probe] video="${videoLine}" audio="${audioLine}"`);
 
-  const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
-  if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
+  const bitrateMatch = videoLine.match(/(\d+)\s*kb\/s/);
+  const videoKbps = bitrateMatch ? parseInt(bitrateMatch[1], 10) : null;
+
+  if (!videoKbps || videoKbps <= STREAM_SAFE_BITRATE_KBPS) {
+    const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
+    if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
+    return;
+  }
+
+  console.log(`ℹ️ remux: битрейт ${videoKbps}kb/s выше порога ${STREAM_SAFE_BITRATE_KBPS}kb/s — поджимаю только битрейт (разрешение не трогаю)`);
+
+  const durMatch = probeStderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  const duration = durMatch ? (+durMatch[1]) * 3600 + (+durMatch[2]) * 60 + parseFloat(durMatch[3]) : 60;
+  let lastEditAt = 0;
+  const onProgress = (t, speed) => {
+    const now = Date.now();
+    if (now - lastEditAt < 6000) return;
+    lastEditAt = now;
+    const pct = Math.min(99, Math.round((t / duration) * 100));
+    const etaSec = speed > 0 ? (duration - t) / speed : null;
+    console.log(`📊 [${progressCtx?.url || input}] поджимаю битрейт: ${pct}%`);
+    if (progressCtx?.statusMsgId) {
+      const etaText = etaSec != null ? formatEta(etaSec) : 'считаю...';
+      bot.editMessageText(
+        `🎛 ${progressCtx.url}\nВидео тяжёлое — готовлю его к отправке...\n⏱ ${pct}%, осталось ${etaText}`,
+        { chat_id: progressCtx.chatId, message_id: progressCtx.statusMsgId, disable_web_page_preview: true }
+      ).catch(() => {});
+    }
+  };
+
+  const onQueued = () => {
+    if (progressCtx?.statusMsgId) {
+      bot.editMessageText(`⏳ ${progressCtx.url}\nВ очереди на обработку (сейчас обрабатывается другое видео)...`, { chat_id: progressCtx.chatId, message_id: progressCtx.statusMsgId, disable_web_page_preview: true }).catch(() => {});
+    }
+  };
+
+  // Только эта, реально тяжёлая ветка идёт через очередь эксклюзивного доступа к CPU —
+  // быстрый copy-путь выше в очередь не попадает вообще.
+  const { code, stderr } = await runCompressionExclusive(() => runFfmpeg([
+    '-y', '-i', input,
+    '-c:v', 'libx264', '-preset', 'veryfast',
+    '-b:v', `${STREAM_SAFE_TARGET_KBPS}k`, '-maxrate', `${Math.round(STREAM_SAFE_TARGET_KBPS * 1.15)}k`, '-bufsize', `${STREAM_SAFE_TARGET_KBPS * 2}k`,
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '160k',
+    '-movflags', '+faststart',
+    output
+  ], onProgress, { stallMs: COMPRESS_STALL_MS, absoluteMs: COMPRESS_ABSOLUTE_MS }), onQueued);
+  if (code === 'timeout:stall') throw new Error('remux: завис, процесс убит');
+  if (code === 'timeout:absolute') throw new Error('remux: превышен потолок времени');
   if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
 }
 
@@ -781,10 +826,13 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
   const { videoPath, version } = result;
   console.log(`ℹ️ [${url}] источник: ${version}${version === 'v1' ? ' (оригинал TikTok, может быть тяжёлым)' : ' (компактное зеркало)'}`);
 
-  // Копирование потока (без перекодирования) — быстро, не грузит CPU, поэтому НЕ ставим
-  // это в очередь эксклюзивного доступа (та нужна только реальным перекодированиям).
+  // remux сам решает внутри себя: если битрейт в норме — просто копирует поток (быстро, без очереди).
+  // Если битрейт выше порога — заводит реальное кодирование через очередь эксклюзивного доступа
+  // к CPU (иначе несколько воркеров одновременно посадят слабый сервер по памяти). Эта логика теперь
+  // целиком внутри самой функции remux, чтобы быстрый путь (подавляющее большинство видео) не стоял
+  // в очереди позади чужих тяжёлых операций, которые к нему вообще не относятся.
   const remuxedPath = videoPath.replace(/\.mp4$/, '') + '_r.mp4';
-  await remux(videoPath, remuxedPath);
+  await remux(videoPath, remuxedPath, { chatId, statusMsgId, url });
   fs.unlinkSync(videoPath);
 
   const quality = getUserQuality(userId);
