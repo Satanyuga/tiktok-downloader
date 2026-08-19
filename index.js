@@ -482,6 +482,14 @@ async function probeVideoInfo(input) {
 // В любом случае логируем реальные строки Video/Audio из ffmpeg (полностью, без обрезки) —
 // если конкретное видео всё равно придёт файлом при "чистом" codec/pix_fmt/audio, у нас
 // в логах будет точная фактура, чтобы разобраться в реальной причине, а не гадать заново.
+// Выше этого битрейта Telegram-клиент, похоже, не успевает забуферить видео на лету и
+// показывает "нужно скачать" вместо мгновенного плеера (проверено фактическим сравнением:
+// 3672kb/s пришло файлом, 241kb/s — мгновенным плеером). Кап опирается на конкретные цифры
+// из логов, а не на догадку "на всякий случай" — трогает только реально тяжёлые по битрейту
+// видео, для абсолютного большинства роликов (обычный битрейт TikTok ниже) ничего не меняется.
+const STREAM_SAFE_BITRATE_KBPS = 2500;
+const STREAM_SAFE_TARGET_KBPS = 2000;
+
 async function remux(input, output) {
   const { stderr: probeStderr } = await runFfmpeg(['-i', input]);
   const videoLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Video:[^\n]*/) || [''])[0];
@@ -492,18 +500,33 @@ async function remux(input, output) {
   const isH264 = /Video:\s*h264/i.test(videoLine);
   const isStandardPixFmt = /yuv420p(?!\w)/i.test(videoLine) || /yuvj420p/i.test(videoLine);
   const isAacOrNoAudio = audioLine === '' || /Audio:\s*aac/i.test(audioLine);
+  const bitrateMatch = videoLine.match(/(\d+)\s*kb\/s/);
+  const videoKbps = bitrateMatch ? parseInt(bitrateMatch[1], 10) : null;
+  const isSafeBitrate = !videoKbps || videoKbps <= STREAM_SAFE_BITRATE_KBPS;
 
-  if (isH264 && isStandardPixFmt && isAacOrNoAudio) {
+  if (isH264 && isStandardPixFmt && isAacOrNoAudio && isSafeBitrate) {
     const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
     if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
     return;
   }
 
-  const reason = !isH264 ? `видеокодек не h264` : !isStandardPixFmt ? `нестандартный формат пикселей` : `аудио не AAC`;
-  console.log(`ℹ️ remux: ${reason} — перекодирую в безопасный h264/yuv420p/aac`);
+  let reason;
+  if (!isH264) reason = 'видеокодек не h264';
+  else if (!isStandardPixFmt) reason = 'нестандартный формат пикселей';
+  else if (!isAacOrNoAudio) reason = 'аудио не AAC';
+  else reason = `битрейт ${videoKbps}kb/s выше безопасного порога ${STREAM_SAFE_BITRATE_KBPS}kb/s`;
+  console.log(`ℹ️ remux: ${reason} — перекодирую`);
+
+  // Для случая "просто высокий битрейт" (кодек и так корректный) держим оригинальное разрешение,
+  // просто ограничиваем битрейт — это дешевле по CPU, чем полный crf-энкод, и не режет резкость.
+  const isBitrateOnlyIssue = isH264 && isStandardPixFmt && isAacOrNoAudio && !isSafeBitrate;
+  const videoArgs = isBitrateOnlyIssue
+    ? ['-c:v', 'libx264', '-preset', 'veryfast', '-b:v', `${STREAM_SAFE_TARGET_KBPS}k`, '-maxrate', `${Math.round(STREAM_SAFE_TARGET_KBPS * 1.15)}k`, '-bufsize', `${STREAM_SAFE_TARGET_KBPS * 2}k`, '-pix_fmt', 'yuv420p']
+    : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p'];
+
   const { code, stderr } = await runFfmpeg([
     '-y', '-i', input,
-    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+    ...videoArgs,
     '-c:a', 'aac', '-b:a', '160k',
     '-movflags', '+faststart',
     output
