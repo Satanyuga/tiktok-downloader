@@ -474,68 +474,13 @@ async function probeVideoInfo(input) {
   };
 }
 
-// Сжимаем ТОЛЬКО битрейт видео, и ТОЛЬКО если он выше порога — ничего больше не трогаем.
-// Порог по прямому указанию: 3500 kb/s. Разрешение и всё остальное видео НЕ меняются —
-// только -b:v/-maxrate ограничивают битрейт сверху, чтобы не переперекодировать зря
-// то, что и так укладывается.
-const STREAM_SAFE_BITRATE_KBPS = 5500;
-const STREAM_SAFE_TARGET_KBPS = 5000;
-
-async function remux(input, output, progressCtx) {
+async function remux(input, output) {
   const { stderr: probeStderr } = await runFfmpeg(['-i', input]);
   const videoLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Video:[^\n]*/) || [''])[0];
   const audioLine = (probeStderr.match(/Stream #\d+:\d+[^\n]*Audio:[^\n]*/) || [''])[0];
   console.log(`🔬 [remux-probe] video="${videoLine}" audio="${audioLine}"`);
 
-  const bitrateMatch = videoLine.match(/(\d+)\s*kb\/s/);
-  const videoKbps = bitrateMatch ? parseInt(bitrateMatch[1], 10) : null;
-
-  if (!videoKbps || videoKbps <= STREAM_SAFE_BITRATE_KBPS) {
-    const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
-    if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
-    return;
-  }
-
-  console.log(`ℹ️ remux: битрейт ${videoKbps}kb/s выше порога ${STREAM_SAFE_BITRATE_KBPS}kb/s — поджимаю только битрейт (разрешение не трогаю)`);
-
-  const durMatch = probeStderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
-  const duration = durMatch ? (+durMatch[1]) * 3600 + (+durMatch[2]) * 60 + parseFloat(durMatch[3]) : 60;
-  let lastEditAt = 0;
-  const onProgress = (t, speed) => {
-    const now = Date.now();
-    if (now - lastEditAt < 6000) return;
-    lastEditAt = now;
-    const pct = Math.min(99, Math.round((t / duration) * 100));
-    const etaSec = speed > 0 ? (duration - t) / speed : null;
-    console.log(`📊 [${progressCtx?.url || input}] поджимаю битрейт: ${pct}%`);
-    if (progressCtx?.statusMsgId) {
-      const etaText = etaSec != null ? formatEta(etaSec) : 'считаю...';
-      bot.editMessageText(
-        `🎛 ${progressCtx.url}\nВидео тяжёлое — готовлю его к отправке...\n⏱ ${pct}%, осталось ${etaText}`,
-        { chat_id: progressCtx.chatId, message_id: progressCtx.statusMsgId, disable_web_page_preview: true }
-      ).catch(() => {});
-    }
-  };
-
-  const onQueued = () => {
-    if (progressCtx?.statusMsgId) {
-      bot.editMessageText(`⏳ ${progressCtx.url}\nВ очереди на обработку (сейчас обрабатывается другое видео)...`, { chat_id: progressCtx.chatId, message_id: progressCtx.statusMsgId, disable_web_page_preview: true }).catch(() => {});
-    }
-  };
-
-  // Только эта, реально тяжёлая ветка идёт через очередь эксклюзивного доступа к CPU —
-  // быстрый copy-путь выше в очередь не попадает вообще.
-  const { code, stderr } = await runCompressionExclusive(() => runFfmpeg([
-    '-y', '-i', input,
-    '-c:v', 'libx264', '-preset', 'veryfast',
-    '-b:v', `${STREAM_SAFE_TARGET_KBPS}k`, '-maxrate', `${Math.round(STREAM_SAFE_TARGET_KBPS * 1.15)}k`, '-bufsize', `${STREAM_SAFE_TARGET_KBPS * 2}k`,
-    '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', '160k',
-    '-movflags', '+faststart',
-    output
-  ], onProgress, { stallMs: COMPRESS_STALL_MS, absoluteMs: COMPRESS_ABSOLUTE_MS }), onQueued);
-  if (code === 'timeout:stall') throw new Error('remux: завис, процесс убит');
-  if (code === 'timeout:absolute') throw new Error('remux: превышен потолок времени');
+  const { code, stderr } = await runFfmpeg(['-y', '-i', input, '-c', 'copy', '-movflags', '+faststart', output]);
   if (code !== 0) throw new Error(`remux exit ${code}: ${stderr.slice(-300)}`);
 }
 
@@ -770,7 +715,7 @@ async function prepareForQuality(remuxedPath, quality, chatId, statusMsgId, url)
 // v2/v3 (могли ответить оба — используем второго как запасной), и только если ни один компактный
 // источник не подошёл — идём в v1 (оригинал).
 async function tryDownloadCandidate(cand, url, roundAttempt) {
-  if (cand.media.images) return { ok: true, images: cand.media.images };
+  if (cand.media.images) return { ok: true, images: cand.media.images, version: cand.version };
   const videoPath = path.resolve(__dirname, `v_${Date.now()}_${roundAttempt}_${cand.version}.mp4`);
   try {
     await downloadAndValidate(cand.media.video, cand.version, videoPath);
@@ -819,7 +764,23 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
   const result = await downloadFromAnyCandidate(url, roundAttempt);
 
   if (result.images) {
-    for (const imgUrl of result.images) await bot.sendPhoto(chatId, imgUrl);
+    // Telegram сам пытается скачать картинку по прямой ссылке, если передать URL как есть —
+    // и падает ("wrong type of the web page content"), потому что CDN TikTok требует правильный
+    // Referer/User-Agent (хотлинк-защита), а у серверов Telegram его, конечно, нет. Качаем картинку
+    // сами (с теми же заголовками, что и видео) и шлём уже готовые байты — так же, как с видео.
+    const { version } = result;
+    for (const imgUrl of result.images) {
+      try {
+        const imgRes = await axios.get(imgUrl, {
+          responseType: 'arraybuffer',
+          headers: { 'User-Agent': UA, 'Referer': REFERERS[version] || '' },
+          timeout: 20000
+        });
+        await bot.sendPhoto(chatId, Buffer.from(imgRes.data));
+      } catch (err) {
+        console.error(`❌ [${url}] не удалось скачать/отправить картинку: ${err.message}`);
+      }
+    }
     return;
   }
 
@@ -832,7 +793,7 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
   // целиком внутри самой функции remux, чтобы быстрый путь (подавляющее большинство видео) не стоял
   // в очереди позади чужих тяжёлых операций, которые к нему вообще не относятся.
   const remuxedPath = videoPath.replace(/\.mp4$/, '') + '_r.mp4';
-  await remux(videoPath, remuxedPath, { chatId, statusMsgId, url });
+  await remux(videoPath, remuxedPath);
   fs.unlinkSync(videoPath);
 
   const quality = getUserQuality(userId);
