@@ -6,6 +6,7 @@ const path = require('path');
 const TiktokDL = require('@tobyg74/tiktok-api-dl');
 const ffmpegPath = require('ffmpeg-static');
 const { spawn } = require('child_process');
+const { instagramGetUrl } = require('instagram-url-direct');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -127,7 +128,8 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const REFERERS = {
   v1: 'https://www.tiktok.com/', // v1 бьёт напрямую в TikTok (не tikwm) — CDN этому и должен соответствовать
   v2: 'https://ssstik.io/',
-  v3: 'https://musicaldown.com/'
+  v3: 'https://musicaldown.com/',
+  instagram: 'https://www.instagram.com/' // CDN Instagram (scontent-*.cdninstagram.com) тоже смотрит на Referer
 };
 // Сколько ссылок скачиваем ОДНОВРЕМЕННО — раньше было 1, отсюда и "трюльками по одной раз в 5 минут".
 const CONCURRENCY = 3;
@@ -137,6 +139,9 @@ const MAX_TELEGRAM_BYTES = 49 * 1024 * 1024;
 
 // Ловит ссылки вида vt.tiktok.com/..., vm.tiktok.com/..., www.tiktok.com/@user/video/...
 const TIKTOK_URL_REGEX = /https?:\/\/(?:[\w-]+\.)?tiktok\.com\/\S+/gi;
+// Ловит Instagram-ссылки на рилсы/посты/IGTV: instagram.com/reel/<id>, instagram.com/p/<id>,
+// instagram.com/<username>/reel/<id>, instagram.com/tv/<id> — с любыми query-параметрами в хвосте.
+const INSTAGRAM_URL_REGEX = /https?:\/\/(?:www\.)?instagram\.com\/(?:[^\/\s]+\/)?(?:reel|reels|p|tv)\/[A-Za-z0-9_-]+\/?(?:\?\S*)?/gi;
 
 // ============================================================================
 // 🎚 ВЫБОР КАЧЕСТВА СКАЧИВАНИЯ (у каждого пользователя своя, независимая настройка)
@@ -265,7 +270,7 @@ bot.on('message', async (msg) => {
   if (text === '/start') {
     const current = getUserQuality(userId);
     return bot.sendMessage(chatId,
-      `👋 Привет! Пришли ссылку на TikTok — скачаю видео без вотемарки.\n\n⚙️ Текущее качество: ${QUALITY_LABELS[current]}\nПоменять — кнопкой "⚙️ Качество" снизу.`,
+      `👋 Привет! Пришли ссылку на TikTok или Instagram Reels — скачаю видео без вотемарки.\n\n⚙️ Текущее качество: ${QUALITY_LABELS[current]}\nПоменять — кнопкой "⚙️ Качество" снизу.`,
       { reply_markup: { keyboard: [['⚙️ Качество']], resize_keyboard: true } }
     );
   }
@@ -283,19 +288,25 @@ bot.on('message', async (msg) => {
     );
   }
 
-  // 4. РАБОТА СО ССЫЛКАМИ — достаём ВСЕ tiktok-ссылки из сообщения (их может быть несколько,
-  // например при пересылке нескольких сообщений одним блоком) и добавляем каждую отдельно.
-  const links = text ? text.match(TIKTOK_URL_REGEX) : null;
-  if (links && links.length) {
-    for (const link of links) {
-      console.log(`📩 Новая ссылка от ${userId} (@${msg.from.username || 'null'}): ${link}`);
+  // 4. РАБОТА СО ССЫЛКАМИ — достаём ВСЕ ссылки (TikTok и Instagram) из сообщения (их может быть
+  // несколько, например при пересылке нескольких сообщений одним блоком) и добавляем каждую отдельно,
+  // с пометкой платформы — дальше вся обработка (скачивание/качество/отправка) общая для обеих.
+  const tiktokLinks = (text ? text.match(TIKTOK_URL_REGEX) : null) || [];
+  const instagramLinks = (text ? text.match(INSTAGRAM_URL_REGEX) : null) || [];
+  const links = [
+    ...tiktokLinks.map(link => ({ link, platform: 'tiktok' })),
+    ...instagramLinks.map(link => ({ link, platform: 'instagram' }))
+  ];
+  if (links.length) {
+    for (const { link, platform } of links) {
+      console.log(`📩 Новая ссылка (${platform}) от ${userId} (@${msg.from.username || 'null'}): ${link}`);
       // Статус-сообщение сразу — юзер видит, что ссылка принята и бот уже работает.
       const statusMsg = await bot.sendMessage(chatId, `⏳ ${link}\nСкачиваю видео...`, { disable_web_page_preview: true });
-      queue.push({ chatId, url: link, statusMsgId: statusMsg.message_id, userId });
+      queue.push({ chatId, url: link, statusMsgId: statusMsg.message_id, userId, platform });
     }
     if (!isProcessing) processQueue();
   } else {
-    bot.sendMessage(chatId, '⚠️ Пришли ссылку на TikTok-видео.');
+    bot.sendMessage(chatId, '⚠️ Пришли ссылку на TikTok-видео или Instagram Reels.');
   }
 });
 
@@ -341,6 +352,44 @@ async function fetchMedia(url, version) {
 // ОБА отказали — идём в v1 как последний резерв (лучше тяжёлое видео, чем никакого).
 const MIRROR_VERSIONS = ['v2', 'v3'];
 const FALLBACK_VERSION = 'v1';
+
+// ============================================================================
+// 📸 INSTAGRAM REELS — отдельный, независимый провайдер (TikTok тут вообще ни при чём).
+// ============================================================================
+// Пакет чисто scraping-based (без официального API, без ключей/логина) — библиотека сама
+// ходит на страницу поста и достаёт embedded JSON.
+// Результат нормализуем в ТОТ ЖЕ формат {version, media:{video} | media:{images}}, что и fetchMedia
+// у TikTok — благодаря этому вся остальная цепочка (tryDownloadCandidate, remux, качество,
+// превью, отправка) работает один в один, без дублирования кода.
+async function fetchInstagramMedia(url) {
+  const data = await instagramGetUrl(url);
+
+  if (!data || !data.url_list || !data.url_list.length) {
+    throw new Error('instagram: не нашёл медиа по ссылке (пост приватный, удалён или неверная ссылка)');
+  }
+
+  // media_details даёт тип каждого элемента (видео/картинка) — url_list был бы недостаточен
+  // для карусели из смеси фото и видео. Поддерживаем и одиночный рилс, и карусель.
+  const details = data.media_details && data.media_details.length ? data.media_details : null;
+  const videos = details ? details.filter(d => d.type === 'video').map(d => d.url) : data.url_list;
+  const images = details ? details.filter(d => d.type === 'image').map(d => d.url) : [];
+
+  if (videos.length) return { version: 'instagram', media: { video: videos[0] } };
+  if (images.length) return { version: 'instagram', media: { images } };
+  throw new Error('instagram: в посте нет ни видео, ни картинок');
+}
+
+async function downloadFromInstagram(url, roundAttempt) {
+  let cand;
+  try {
+    cand = await fetchInstagramMedia(url);
+  } catch (err) {
+    throw new Error(`instagram отказ: ${err.message}`);
+  }
+  const result = await tryDownloadCandidate(cand, url, roundAttempt);
+  if (result.ok) return result;
+  throw new Error(`instagram: ${result.err.message}`);
+}
 
 // (старая fetchMediaAnyProvider удалена — логика с фолбэком внутри круга теперь в downloadFromAnyCandidate ниже)
 
@@ -760,14 +809,18 @@ async function downloadFromAnyCandidate(url, roundAttempt) {
 }
 
 // Один полный круг: спросить у провайдеров (параллельно, с фолбэком внутри круга) и отправить результат в Telegram.
-async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
-  const result = await downloadFromAnyCandidate(url, roundAttempt);
+// platform — 'tiktok' (несколько провайдеров-зеркал с фолбэком) или 'instagram' (отдельный,
+// независимый путь, см. downloadFromInstagram выше) — дальше вся обработка общая для обеих.
+async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId, platform) {
+  const result = platform === 'instagram'
+    ? await downloadFromInstagram(url, roundAttempt)
+    : await downloadFromAnyCandidate(url, roundAttempt);
 
   if (result.images) {
     // Telegram сам пытается скачать картинку по прямой ссылке, если передать URL как есть —
-    // и падает ("wrong type of the web page content"), потому что CDN TikTok требует правильный
-    // Referer/User-Agent (хотлинк-защита), а у серверов Telegram его, конечно, нет. Качаем картинку
-    // сами (с теми же заголовками, что и видео) и шлём уже готовые байты — так же, как с видео.
+    // и падает ("wrong type of the web page content"), потому что CDN (TikTok/Instagram) требует
+    // правильный Referer/User-Agent (хотлинк-защита), а у серверов Telegram его, конечно, нет.
+    // Качаем картинку сами (с теми же заголовками, что и видео) и шлём уже готовые байты.
     const { version } = result;
     for (const imgUrl of result.images) {
       try {
@@ -785,13 +838,9 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
   }
 
   const { videoPath, version } = result;
-  console.log(`ℹ️ [${url}] источник: ${version}${version === 'v1' ? ' (оригинал TikTok, может быть тяжёлым)' : ' (компактное зеркало)'}`);
+  console.log(`ℹ️ [${url}] источник: ${version}${version === 'v1' ? ' (оригинал TikTok, может быть тяжёлым)' : version === 'instagram' ? ' (Instagram)' : ' (компактное зеркало)'}`);
 
-  // remux сам решает внутри себя: если битрейт в норме — просто копирует поток (быстро, без очереди).
-  // Если битрейт выше порога — заводит реальное кодирование через очередь эксклюзивного доступа
-  // к CPU (иначе несколько воркеров одновременно посадят слабый сервер по памяти). Эта логика теперь
-  // целиком внутри самой функции remux, чтобы быстрый путь (подавляющее большинство видео) не стоял
-  // в очереди позади чужих тяжёлых операций, которые к нему вообще не относятся.
+  // Копирование потока (без перекодирования) — быстро, не грузит CPU.
   const remuxedPath = videoPath.replace(/\.mp4$/, '') + '_r.mp4';
   await remux(videoPath, remuxedPath);
   fs.unlinkSync(videoPath);
@@ -830,10 +879,10 @@ async function fetchAndSend(chatId, url, roundAttempt, statusMsgId, userId) {
 
 // Повторяет ПОЛНЫЙ круг по всем провайдерам ещё раз, если с первого захода не вышло.
 // Управляет статус-сообщением: удаляет его при успехе, показывает ошибку при полном отказе.
-async function downloadWithRetry(chatId, url, statusMsgId, userId) {
+async function downloadWithRetry(chatId, url, statusMsgId, userId, platform) {
   for (let round = 1; round <= RETRY_ROUNDS; round++) {
     try {
-      await fetchAndSend(chatId, url, round, statusMsgId, userId);
+      await fetchAndSend(chatId, url, round, statusMsgId, userId, platform);
       if (statusMsgId) bot.deleteMessage(chatId, statusMsgId).catch(() => {});
       return;
     } catch (err) {
@@ -861,7 +910,7 @@ async function worker() {
   while (queue.length > 0) {
     const item = queue.shift();
     if (!item) return;
-    await downloadWithRetry(item.chatId, item.url, item.statusMsgId, item.userId);
+    await downloadWithRetry(item.chatId, item.url, item.statusMsgId, item.userId, item.platform);
   }
 }
 
