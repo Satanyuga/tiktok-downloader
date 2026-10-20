@@ -7,6 +7,12 @@ const TiktokDL = require('@tobyg74/tiktok-api-dl');
 const ffmpegPath = require('ffmpeg-static');
 const { spawn } = require('child_process');
 const { instagramGetUrl } = require('instagram-url-direct');
+const { igdl: btchIgdl } = require('btch-downloader');
+// ultra-igdl требует Node >=20.18.1. Если на хостинге Node старее — бот не должен падать целиком,
+// просто этот провайдер будет пропущен в цепочке Instagram (причина попадёт в лог).
+let UltraIgdl = null;
+let ultraIgdlLoadError = null;
+try { UltraIgdl = require('ultra-igdl').ultraigdl; } catch (e) { ultraIgdlLoadError = e.message; }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -354,41 +360,136 @@ const MIRROR_VERSIONS = ['v2', 'v3'];
 const FALLBACK_VERSION = 'v1';
 
 // ============================================================================
-// 📸 INSTAGRAM REELS — отдельный, независимый провайдер (TikTok тут вообще ни при чём).
+// 📸 INSTAGRAM REELS — цепочка независимых провайдеров с фолбэком (TikTok тут вообще ни при чём).
 // ============================================================================
-// Пакет чисто scraping-based (без официального API, без ключей/логина) — библиотека сама
-// ходит на страницу поста и достаёт embedded JSON.
-// Результат нормализуем в ТОТ ЖЕ формат {version, media:{video} | media:{images}}, что и fetchMedia
-// у TikTok — благодаря этому вся остальная цепочка (tryDownloadCandidate, remux, качество,
+// Один неофициальный провайдер ненадёжен: Instagram режет запросы с IP хостингов (на Render видели
+// 401, в песочнице 403 Failed to obtain CSRF). Поэтому, как и у TikTok, пробуем провайдеров по очереди
+// в ФИКСИРОВАННОМ порядке и в пределах одного круга: отказал один (любая ошибка, в т.ч. "ответил, но
+// файл не скачался") — сразу следующий. Провайдеры разные по природе:
+//   1. btch-downloader — запрос к Instagram делает ЧУЖОЙ сервер (backend1.tioo.eu.org), а не мы, поэтому
+//      блокировка IP Render его не касается (но это один сторонний бэкенд — он сам может лежать).
+//   2. instagram-url-direct — скрейпинг страницы поста с нашего IP (тот, что отдавал 401 на Render).
+//   3. ultra-igdl — другой независимый парсер, тоже с нашего IP, без куков.
+//   4. embed-page — свой минимальный парсер публичной embed-страницы поста, без куков.
+// Каждый провайдер приводит результат к ТОМУ ЖЕ формату {version, media:{video} | media:{images}},
+// что и fetchMedia у TikTok — вся остальная цепочка (tryDownloadCandidate, remux, качество,
 // превью, отправка) работает один в один, без дублирования кода.
-async function fetchInstagramMedia(url) {
-  const data = await instagramGetUrl(url);
+const INSTAGRAM_PROVIDER_TIMEOUT_MS = 30 * 1000; // провайдер молчит дольше — считаем отказавшим
 
-  if (!data || !data.url_list || !data.url_list.length) {
-    throw new Error('instagram: не нашёл медиа по ссылке (пост приватный, удалён или неверная ссылка)');
+// Понятная причина отказа для лога: HTTP-статус (если есть), код сети, текст.
+function describeError(err) {
+  if (!err) return 'неизвестная ошибка';
+  const parts = [];
+  if (err.response && err.response.status) parts.push(`HTTP ${err.response.status}`);
+  if (err.code && !/^ERR_BAD_/.test(err.code)) parts.push(err.code);
+  parts.push(err.message || String(err));
+  return parts.join(' ');
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}: нет ответа за ${ms / 1000}с`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Общая нормализация: items = [{type:'video'|'image', url}]. Видео в приоритете (рилс),
+// иначе картинки (пост/карусель из фото) — тот же выбор, что был у единственного провайдера раньше.
+function normalizeInstagramItems(items) {
+  const videos = items.filter(i => i.type === 'video' && i.url).map(i => i.url);
+  const images = items.filter(i => i.type === 'image' && i.url).map(i => i.url);
+  if (videos.length) return { version: 'instagram', media: { video: videos[0] } };
+  if (images.length) return { version: 'instagram', media: { images } };
+  throw new Error('в ответе нет ни видео, ни картинок (пост приватный, удалён или неверная ссылка)');
+}
+
+async function igViaBtch(url) {
+  const data = await btchIgdl(url);
+  // btch-downloader не бросает исключение: при ошибке возвращает {status:false, message}
+  if (!data || data.status !== true || !Array.isArray(data.result) || !data.result.length) {
+    throw new Error(`отказ бэкенда: ${(data && data.message) || 'пустой ответ'}`);
   }
+  // В ответе нет поля "тип" — только url. Определяем по расширению в пути CDN-ссылки.
+  // Если расширение неочевидно — считаем видео: downloadAndValidate всё равно проверит content-type.
+  const items = data.result.map(r => {
+    const p = String(r.url || '').split('?')[0];
+    return { type: /\.(jpe?g|png|webp|heic)$/i.test(p) ? 'image' : 'video', url: r.url };
+  });
+  return normalizeInstagramItems(items);
+}
 
+async function igViaUrlDirect(url) {
+  const data = await instagramGetUrl(url);
+  if (!data || !data.url_list || !data.url_list.length) {
+    throw new Error('не нашёл медиа по ссылке (пост приватный, удалён или неверная ссылка)');
+  }
   // media_details даёт тип каждого элемента (видео/картинка) — url_list был бы недостаточен
   // для карусели из смеси фото и видео. Поддерживаем и одиночный рилс, и карусель.
   const details = data.media_details && data.media_details.length ? data.media_details : null;
-  const videos = details ? details.filter(d => d.type === 'video').map(d => d.url) : data.url_list;
-  const images = details ? details.filter(d => d.type === 'image').map(d => d.url) : [];
-
-  if (videos.length) return { version: 'instagram', media: { video: videos[0] } };
-  if (images.length) return { version: 'instagram', media: { images } };
-  throw new Error('instagram: в посте нет ни видео, ни картинок');
+  const items = details
+    ? details.map(d => ({ type: d.type, url: d.url }))
+    : data.url_list.map(u => ({ type: 'video', url: u }));
+  return normalizeInstagramItems(items);
 }
 
-async function downloadFromInstagram(url, roundAttempt) {
-  let cand;
-  try {
-    cand = await fetchInstagramMedia(url);
-  } catch (err) {
-    throw new Error(`instagram отказ: ${err.message}`);
+async function igViaUltra(url) {
+  if (!UltraIgdl) throw new Error(`пакет не загрузился (${ultraIgdlLoadError || 'нужен Node >=20.18.1'})`);
+  const ig = new UltraIgdl({ cache: false, retries: 1, timeoutMs: 20000 });
+  const res = await ig.download(url);
+  if (!res || res.code !== 200 || !Array.isArray(res.media) || !res.media.length) {
+    throw new Error(`код ${res && res.code}: ${(res && res.message) || 'пустой ответ'}`);
   }
-  const result = await tryDownloadCandidate(cand, url, roundAttempt);
-  if (result.ok) return result;
-  throw new Error(`instagram: ${result.err.message}`);
+  return normalizeInstagramItems(res.media.map(m => ({ type: m.type, url: m.url })));
+}
+
+// Свой минимальный парсер публичной embed-страницы (/embed/captioned/) — без куков и без пакетов.
+// ВНИМАНИЕ: формат страницы Instagram не документирован и меняется; в песочнице проверить нельзя
+// (instagram.com закрыт). Если поле video_url не найдено — честно отказываем и пишем в лог
+// HTTP-статус и размер страницы, чтобы по логу Render было видно, что именно пришло.
+async function igViaEmbed(url) {
+  const m = url.match(/instagram\.com\/(?:[^\/\s]+\/)?(?:reel|reels|p|tv)\/([A-Za-z0-9_-]+)/i);
+  if (!m) throw new Error('не удалось выделить shortcode из ссылки');
+  const res = await axios.get(`https://www.instagram.com/p/${m[1]}/embed/captioned/`, {
+    timeout: 20000,
+    headers: { 'User-Agent': UA, 'Accept-Language': 'en-US,en;q=0.9' }
+  });
+  const html = typeof res.data === 'string' ? res.data : '';
+  const v = html.match(/"video_url":"((?:[^"\\]|\\.)*)"/);
+  if (!v) throw new Error(`HTTP ${res.status}, страница ${html.length} байт, video_url не найден`);
+  return normalizeInstagramItems([{ type: 'video', url: JSON.parse(`"${v[1]}"`) }]);
+}
+
+// Порядок фиксированный (см. комментарий выше) — одна и та же ссылка стабильно проходит одну и ту же цепочку.
+const INSTAGRAM_PROVIDERS = [
+  { name: 'btch-downloader', fetch: igViaBtch },
+  { name: 'instagram-url-direct', fetch: igViaUrlDirect },
+  { name: 'ultra-igdl', fetch: igViaUltra },
+  { name: 'embed-page', fetch: igViaEmbed }
+];
+
+async function downloadFromInstagram(url, roundAttempt) {
+  const failures = [];
+  for (const provider of INSTAGRAM_PROVIDERS) {
+    let cand;
+    try {
+      cand = await withTimeout(provider.fetch(url), INSTAGRAM_PROVIDER_TIMEOUT_MS, provider.name);
+    } catch (err) {
+      const why = describeError(err);
+      console.log(`⚠️ [${url}] instagram/${provider.name}: отказ — ${why}`);
+      failures.push(`${provider.name}: ${why}`);
+      continue;
+    }
+    const result = await tryDownloadCandidate(cand, url, roundAttempt);
+    if (result.ok) {
+      console.log(`✅ [${url}] instagram/${provider.name}: успех`);
+      return result;
+    }
+    const why = describeError(result.err);
+    console.log(`⚠️ [${url}] instagram/${provider.name}: ссылку дал, но скачать не вышло — ${why}`);
+    failures.push(`${provider.name} (скачивание): ${why}`);
+  }
+  throw new Error(`instagram: все провайдеры отказали: ${failures.join(' | ')}`);
 }
 
 // (старая fetchMediaAnyProvider удалена — логика с фолбэком внутри круга теперь в downloadFromAnyCandidate ниже)
