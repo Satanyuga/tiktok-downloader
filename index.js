@@ -864,11 +864,30 @@ async function prepareForQuality(remuxedPath, quality, chatId, statusMsgId, url)
 // пробуем остальных провайдеров СРАЗУ, в рамках этого же круга: сначала все, кто ответил среди
 // v2/v3 (могли ответить оба — используем второго как запасной), и только если ни один компактный
 // источник не подошёл — идём в v1 (оригинал).
+// Определяет изображение по "магическим" байтам в начале файла (JPEG / PNG / WEBP / GIF).
+function looksLikeImageFile(filePath) {
+  const fd = fs.openSync(filePath, 'r');
+  const b = Buffer.alloc(12);
+  try { fs.readSync(fd, b, 0, 12, 0); } finally { fs.closeSync(fd); }
+  if (b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return true; // JPEG
+  if (b.toString('latin1', 1, 4) === 'PNG') return true; // PNG
+  if (b.toString('latin1', 0, 3) === 'GIF') return true; // GIF
+  if (b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP') return true; // WEBP
+  return false;
+}
+
 async function tryDownloadCandidate(cand, url, roundAttempt) {
   if (cand.media.images) return { ok: true, images: cand.media.images, version: cand.version };
   const videoPath = path.resolve(__dirname, `v_${Date.now()}_${roundAttempt}_${cand.version}.mp4`);
   try {
     await downloadAndValidate(cand.media.video, cand.version, videoPath);
+    // Провайдер мог назвать картинку "видео" (нет расширения в ссылке, сервер отдал не image/* content-type).
+    // Смотрим реальные первые байты файла: если это изображение — отправляем как фото, а не как битый mp4.
+    if (looksLikeImageFile(videoPath)) {
+      console.log(`🖼 [${url}] ${cand.version}: по содержимому это картинка, а не видео — отправлю как фото`);
+      fs.unlinkSync(videoPath);
+      return { ok: true, images: [cand.media.video], version: cand.version };
+    }
     console.log(`ℹ️ [${url}] скачано (${cand.version}): ${(fs.statSync(videoPath).size / 1024 / 1024).toFixed(1)}MB`);
     return { ok: true, videoPath, version: cand.version };
   } catch (err) {
